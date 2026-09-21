@@ -49,7 +49,17 @@ app.get('/', (req, res) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Bot Online Monitor</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+  // cdn ekak fail unoth wenath cdn ekakin try karanawa (fallback)
+  window.addEventListener('error', function(e) {
+    if (e.target && e.target.tagName === 'SCRIPT' && e.target.src && e.target.src.includes('chart.umd')) {
+      const fallback = document.createElement('script');
+      fallback.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js';
+      document.head.appendChild(fallback);
+    }
+  }, true);
+</script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {

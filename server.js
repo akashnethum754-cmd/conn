@@ -40,6 +40,188 @@ app.get('/api/online-count', async (req, res) => {
   }
 });
 
+app.use(express.json());
+
+// Access key eken bot settings ganna (mask karala number eka pennanawa)
+app.get('/api/bot-settings/:key', async (req, res) => {
+  try {
+    const key = req.params.key.trim();
+    const doc = await collection.findOne({ 'config.accessKey': key });
+    if (!doc) return res.status(404).json({ error: 'Access key eka wenna baruwa nathnam wenas welada thiyenne' });
+
+    const cfg = doc.config || {};
+    const maskedNumber = doc.number ? doc.number.slice(0, 4) + '••••' + doc.number.slice(-2) : 'N/A';
+
+    res.json({
+      number: maskedNumber,
+      BOT_NAME: cfg.BOT_NAME || '',
+      BOT_IMAGE: cfg.BOT_IMAGE || '',
+      BOT_FOOTER: cfg.BOT_FOOTER || ''
+    });
+  } catch (err) {
+    console.error('bot-settings GET error:', err.message);
+    res.status(500).json({ error: 'Data ganna bari una' });
+  }
+});
+
+// Access key eken bot settings save karanna (thamange bot eka witharai edit wenne)
+app.post('/api/bot-settings/:key', async (req, res) => {
+  try {
+    const key = req.params.key.trim();
+    const { BOT_NAME, BOT_IMAGE, BOT_FOOTER } = req.body || {};
+
+    const doc = await collection.findOne({ 'config.accessKey': key });
+    if (!doc) return res.status(404).json({ error: 'Access key eka wenna baruwa' });
+
+    const update = {};
+    if (typeof BOT_NAME === 'string') update['config.BOT_NAME'] = BOT_NAME.trim();
+    if (typeof BOT_IMAGE === 'string') update['config.BOT_IMAGE'] = BOT_IMAGE.trim();
+    if (typeof BOT_FOOTER === 'string') update['config.BOT_FOOTER'] = BOT_FOOTER.trim();
+    update['updatedAt'] = new Date();
+
+    await collection.updateOne({ 'config.accessKey': key }, { $set: update });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('bot-settings POST error:', err.message);
+    res.status(500).json({ error: 'Save karanna bari una' });
+  }
+});
+
+// Bot settings edit page (access key eken login wenawa)
+app.get('/manage', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.send(`<!DOCTYPE html>
+<html lang="si">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bot Settings - Manage</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+    color: #e2e8f0;
+    min-height: 100vh;
+    padding: 24px 16px;
+  }
+  .wrap { max-width: 480px; margin: 0 auto; }
+  h1 {
+    font-size: 20px; font-weight: 700; margin-bottom: 4px;
+    background: linear-gradient(90deg, #34d399, #60a5fa);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+  .card {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px; padding: 20px; margin-bottom: 14px;
+  }
+  label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; margin-top: 14px; }
+  input {
+    width: 100%; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.25);
+    color: #e2e8f0; font-size: 14px;
+  }
+  input:focus { outline: none; border-color: #34d399; }
+  button {
+    width: 100%; margin-top: 18px; padding: 12px; border: none; border-radius: 10px;
+    background: linear-gradient(90deg, #34d399, #60a5fa); color: #0f172a;
+    font-weight: 700; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; }
+  .msg { font-size: 13px; margin-top: 12px; display: none; }
+  .msg.ok { color: #34d399; }
+  .msg.err { color: #f87171; }
+  .hidden { display: none; }
+  .botnum { font-size: 13px; color: #60a5fa; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔧 Bot Settings</h1>
+  <div class="sub">Access Key eken login wela oyage bot eke Name / Image / Footer venas karanna</div>
+
+  <div class="card" id="loginCard">
+    <label>Access Key</label>
+    <input id="keyInput" placeholder="e.g. A1B2C3D4E5" autocapitalize="characters">
+    <button id="loginBtn">Login</button>
+    <div class="msg err" id="loginMsg"></div>
+  </div>
+
+  <div class="card hidden" id="editCard">
+    <div class="botnum" id="botNum"></div>
+    <label>Bot Name</label>
+    <input id="botName" placeholder="e.g. My Cool Bot">
+    <label>Bot Image URL</label>
+    <input id="botImage" placeholder="https://...">
+    <label>Bot Footer Text</label>
+    <input id="botFooter" placeholder="e.g. Powered by...">
+    <button id="saveBtn">Save Changes</button>
+    <div class="msg" id="saveMsg"></div>
+  </div>
+</div>
+
+<script>
+  let currentKey = null;
+  const loginCard = document.getElementById('loginCard');
+  const editCard = document.getElementById('editCard');
+  const loginMsg = document.getElementById('loginMsg');
+  const saveMsg = document.getElementById('saveMsg');
+
+  document.getElementById('loginBtn').addEventListener('click', async () => {
+    const key = document.getElementById('keyInput').value.trim();
+    if (!key) return;
+    loginMsg.style.display = 'none';
+    try {
+      const res = await fetch('/api/bot-settings/' + encodeURIComponent(key), { cache: 'no-store' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Login fail una');
+
+      currentKey = key;
+      document.getElementById('botNum').textContent = 'Bot: ' + data.number;
+      document.getElementById('botName').value = data.BOT_NAME;
+      document.getElementById('botImage').value = data.BOT_IMAGE;
+      document.getElementById('botFooter').value = data.BOT_FOOTER;
+
+      loginCard.classList.add('hidden');
+      editCard.classList.remove('hidden');
+    } catch (e) {
+      loginMsg.textContent = '⚠ ' + e.message;
+      loginMsg.style.display = 'block';
+    }
+  });
+
+  document.getElementById('saveBtn').addEventListener('click', async () => {
+    if (!currentKey) return;
+    saveMsg.style.display = 'none';
+    try {
+      const res = await fetch('/api/bot-settings/' + encodeURIComponent(currentKey), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          BOT_NAME: document.getElementById('botName').value,
+          BOT_IMAGE: document.getElementById('botImage').value,
+          BOT_FOOTER: document.getElementById('botFooter').value
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Save fail una');
+
+      saveMsg.textContent = '✅ Save una! Bot eka reconnect wena wita apply wenawa.';
+      saveMsg.className = 'msg ok';
+      saveMsg.style.display = 'block';
+    } catch (e) {
+      saveMsg.textContent = '⚠ ' + e.message;
+      saveMsg.className = 'msg err';
+      saveMsg.style.display = 'block';
+    }
+  });
+</script>
+</body>
+</html>`);
+});
+
 // Chart page eka (single file - inline HTML)
 app.get('/', (req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -115,7 +297,7 @@ app.get('/', (req, res) => {
 <body>
 <div class="wrap">
   <h1>🤖 Bot Online Monitor</h1>
-  <div class="sub"><span class="status-dot"></span>Live - real-time update</div>
+  <div class="sub"><span class="status-dot"></span>Live - real-time update &nbsp;•&nbsp; <a href="/manage" style="color:#60a5fa">⚙ Manage your bot</a></div>
 
   <div class="stats">
     <div class="card online">

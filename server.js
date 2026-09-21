@@ -42,6 +42,7 @@ app.get('/api/online-count', async (req, res) => {
 
 // Chart page eka (single file - inline HTML)
 app.get('/', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.send(`<!DOCTYPE html>
 <html lang="si">
 <head>
@@ -127,64 +128,76 @@ app.get('/', (req, res) => {
   const ctx = document.getElementById('botChart').getContext('2d');
   const errBox = document.getElementById('errBox');
 
-  const chart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'Online Bots',
-        data: [],
-        borderColor: '#34d399',
-        backgroundColor: 'rgba(52,211,153,0.15)',
-        pointBackgroundColor: '#34d399',
-        pointBorderColor: '#0f172a',
-        pointRadius: 5,
-        pointHoverRadius: 7,
-        borderWidth: 2,
-        tension: 0.35,
-        fill: true,
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: { duration: 400 },
-      scales: {
-        x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: {
-          beginAtZero: true,
-          ticks: { color: '#94a3b8', stepSize: 1 },
-          grid: { color: 'rgba(255,255,255,0.05)' }
-        }
-      },
-      plugins: {
-        legend: { labels: { color: '#e2e8f0' } }
-      }
-    }
-  });
-
   const MAX_POINTS = 30;
+  let chart = null;
+
+  // Chart.js load wela nathnam mekata error ekak enawa,
+  // eth eka baseline numbers update wena logic eka nawaththanna ba widihata try/catch ekak dala thiyenne
+  try {
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'Online Bots',
+          data: [],
+          borderColor: '#34d399',
+          backgroundColor: 'rgba(52,211,153,0.15)',
+          pointBackgroundColor: '#34d399',
+          pointBorderColor: '#0f172a',
+          pointRadius: 5,
+          pointHoverRadius: 7,
+          borderWidth: 2,
+          tension: 0.35,
+          fill: true,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 400 },
+        scales: {
+          x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+          y: {
+            beginAtZero: true,
+            ticks: { color: '#94a3b8', stepSize: 1 },
+            grid: { color: 'rgba(255,255,255,0.05)' }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: '#e2e8f0' } }
+        }
+      }
+    });
+  } catch (chartErr) {
+    console.error('Chart.js init failed:', chartErr);
+    errBox.textContent = '⚠ Chart library load wenne na, eth numbers update wenawa';
+    errBox.style.display = 'block';
+  }
 
   async function fetchData() {
     try {
-      const res = await fetch('/api/online-count');
-      if (!res.ok) throw new Error('Server error');
+      const res = await fetch('/api/online-count', { cache: 'no-store' });
+      if (!res.ok) throw new Error('Server error: ' + res.status);
       const data = await res.json();
 
       document.getElementById('onlineVal').textContent = data.online;
       document.getElementById('totalVal').textContent = data.total;
-      errBox.style.display = 'none';
+      if (chart) errBox.style.display = 'none';
 
-      const label = new Date(data.time).toLocaleTimeString('en-GB');
-      chart.data.labels.push(label);
-      chart.data.datasets[0].data.push(data.online);
+      if (chart) {
+        const label = new Date(data.time).toLocaleTimeString('en-GB');
+        chart.data.labels.push(label);
+        chart.data.datasets[0].data.push(data.online);
 
-      if (chart.data.labels.length > MAX_POINTS) {
-        chart.data.labels.shift();
-        chart.data.datasets[0].data.shift();
+        if (chart.data.labels.length > MAX_POINTS) {
+          chart.data.labels.shift();
+          chart.data.datasets[0].data.shift();
+        }
+        chart.update();
       }
-      chart.update();
     } catch (e) {
+      console.error('fetchData failed:', e);
       errBox.textContent = '⚠ Data load karanna baruwa: ' + e.message;
       errBox.style.display = 'block';
     }
@@ -205,4 +218,3 @@ connectDB()
     console.error('❌ MongoDB connection failed:', err.message);
     process.exit(1);
   });
-

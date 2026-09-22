@@ -136,7 +136,9 @@ app.get('/api/bot-settings/:key', async (req, res) => {
 
       BOT_IMAGE: cfg.BOT_IMAGE || '',
 
-      BOT_FOOTER: cfg.BOT_FOOTER || ''
+      BOT_FOOTER: cfg.BOT_FOOTER || '',
+
+      MOVIE_FOOTER: cfg.MOVIE_FOOTER || ''
     });
 
   } catch (err) {
@@ -174,7 +176,8 @@ app.post('/api/bot-settings/:key', async (req, res) => {
     const {
       BOT_NAME,
       BOT_IMAGE,
-      BOT_FOOTER
+      BOT_FOOTER,
+      MOVIE_FOOTER
     } = req.body || {};
 
     const doc = await collection.findOne({
@@ -202,6 +205,11 @@ app.post('/api/bot-settings/:key', async (req, res) => {
     if (typeof BOT_FOOTER === 'string') {
       update['config.BOT_FOOTER'] =
         BOT_FOOTER.trim();
+    }
+
+    if (typeof MOVIE_FOOTER === 'string') {
+      update['config.MOVIE_FOOTER'] =
+        MOVIE_FOOTER.trim();
     }
 
     update['updatedAt'] = new Date();
@@ -720,6 +728,8 @@ button:disabled {
 
   display: flex;
 
+  flex-direction: column;
+
   align-items: flex-start;
 }
 
@@ -805,6 +815,36 @@ button:disabled {
   text-align: right;
 
   margin-top: 4px;
+}
+
+/* =========================================================
+   MOVIE MESSAGE
+========================================================= */
+
+.movie-message {
+
+  margin-top: 14px;
+
+  border-left: 3px solid #f59e0b;
+}
+
+.movie-message:before {
+
+  border-top:
+    9px solid #202c33;
+}
+
+.movie-message .message-title {
+
+  color: #f59e0b;
+}
+
+.movie-message .message-footer {
+
+  color: #fbbf24;
+
+  border-top:
+    1px solid rgba(245,158,11,.15);
 }
 
 /* =========================================================
@@ -954,6 +994,17 @@ button:disabled {
       >
 
 
+      <label>
+        🎬 Movie Footer Text
+      </label>
+
+      <input
+        id="movieFooter"
+        placeholder="e.g. 🎬 POWERED BY MOVIE ZONE"
+        autocomplete="off"
+      >
+
+
       <button id="saveBtn">
         💾 Save Changes
       </button>
@@ -1037,6 +1088,8 @@ button:disabled {
 
         <div class="chat-area">
 
+          <!-- NORMAL MESSAGE -->
+
           <div class="message">
 
             <div
@@ -1071,6 +1124,46 @@ button:disabled {
 
             <div class="message-time">
               10:30 ✓✓
+            </div>
+
+          </div>
+
+
+          <!-- 🎬 MOVIE MESSAGE PREVIEW -->
+
+          <div class="message movie-message">
+
+            <div class="message-title">
+              🎬 Movie Info
+            </div>
+
+            <div class="message-text">
+
+              🎥 <b>Title:</b> Avatar 2
+
+              <br>
+
+              📅 <b>Year:</b> 2022
+
+              <br>
+
+              ⭐ <b>Rating:</b> 8.5
+
+              <br>
+
+              🔗 <b>Download:</b> example.com
+
+            </div>
+
+            <div
+              class="message-footer"
+              id="previewMovieFooter"
+            >
+              🎬 POWERED BY MOVIE ZONE
+            </div>
+
+            <div class="message-time">
+              10:31 ✓✓
             </div>
 
           </div>
@@ -1118,6 +1211,9 @@ const botImage =
 const botFooter =
   document.getElementById('botFooter');
 
+const movieFooter =
+  document.getElementById('movieFooter');
+
 const previewName =
   document.getElementById('previewName');
 
@@ -1128,6 +1224,11 @@ const previewMessageName =
 
 const previewFooter =
   document.getElementById('previewFooter');
+
+const previewMovieFooter =
+  document.getElementById(
+    'previewMovieFooter'
+  );
 
 const previewImage =
   document.getElementById(
@@ -1155,6 +1256,9 @@ function updatePreview() {
   const footer =
     botFooter.value.trim();
 
+  const movieFt =
+    movieFooter.value.trim();
+
 
   /* BOT NAME */
 
@@ -1165,10 +1269,16 @@ function updatePreview() {
     '🤖 ' + (name || 'My Bot');
 
 
-  /* FOOTER */
+  /* BOT FOOTER */
 
   previewFooter.textContent =
     footer || 'POWERED BY LYNKO';
+
+
+  /* 🎬 MOVIE FOOTER */
+
+  previewMovieFooter.textContent =
+    movieFt || '🎬 POWERED BY MOVIE ZONE';
 
 
   /* IMAGE */
@@ -1213,6 +1323,11 @@ botImage.addEventListener(
 );
 
 botFooter.addEventListener(
+  'input',
+  updatePreview
+);
+
+movieFooter.addEventListener(
   'input',
   updatePreview
 );
@@ -1323,6 +1438,9 @@ async function login() {
 
     botFooter.value =
       data.BOT_FOOTER || '';
+
+    movieFooter.value =
+      data.MOVIE_FOOTER || '';
 
 
     /* Preview */
@@ -1443,7 +1561,10 @@ async function saveSettings() {
               botImage.value.trim(),
 
             BOT_FOOTER:
-              botFooter.value.trim()
+              botFooter.value.trim(),
+
+            MOVIE_FOOTER:
+              movieFooter.value.trim()
 
           })
 

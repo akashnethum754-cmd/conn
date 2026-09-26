@@ -5,11 +5,9 @@ const { MongoClient } = require('mongodb');
 
 const app = express();
 
-const PORT =
-  process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-const MONGODB_URI =
-  process.env.MONGODB_URI;
+const MONGODB_URI = process.env.MONGODB_URI;
 
 const DB_NAME =
   process.env.DB_NAME || 'test';
@@ -17,86 +15,69 @@ const DB_NAME =
 const COLLECTION_NAME =
   process.env.COLLECTION_NAME || 'sessions';
 
-const METRICS_COLLECTION_NAME =
-  process.env.METRICS_COLLECTION_NAME ||
-  'bot_metrics';
-
 const TIMESTAMP_FIELD =
-  process.env.TIMESTAMP_FIELD ||
-  'lastSeen';
+  process.env.TIMESTAMP_FIELD || 'lastSeen';
+
+const METRICS_COLLECTION_NAME =
+  process.env.METRICS_COLLECTION_NAME || 'bot_metrics';
 
 const ONLINE_THRESHOLD_MINUTES =
-  Number(
-    process.env.ONLINE_THRESHOLD_MINUTES || 2
-  );
+  Number(process.env.ONLINE_THRESHOLD_MINUTES || 2);
 
 const PAIR_WEB_URL =
   process.env.PAIR_WEB_URL ||
   'https://www.shaggytech.online';
 
-const DEFAULT_MODE =
-  String(
-    process.env.MODE || 'PUBLIC'
-  ).toUpperCase();
-
 if (!MONGODB_URI) {
-  console.error(
-    '❌ MONGODB_URI .env file eke danna one!'
-  );
-
+  console.error('❌ MONGODB_URI .env file eke danna one!');
   process.exit(1);
 }
 
 let collection;
+let autoRepliesCollection;
 let metricsCollection;
-
+let mongoClient;
 
 /* =========================================================
-   DATABASE
+   MONGODB CONNECTION
 ========================================================= */
 
 async function connectDB() {
+  mongoClient = new MongoClient(MONGODB_URI);
 
-  const client =
-    new MongoClient(
-      MONGODB_URI
-    );
+  await mongoClient.connect();
 
-  await client.connect();
+  const db = mongoClient.db(DB_NAME);
 
-  const db =
-    client.db(DB_NAME);
+  collection = db.collection(COLLECTION_NAME);
 
-  collection =
-    db.collection(
-      COLLECTION_NAME
-    );
+  autoRepliesCollection =
+    db.collection('autoreplies');
 
   metricsCollection =
-    db.collection(
-      METRICS_COLLECTION_NAME
-    );
+    db.collection(METRICS_COLLECTION_NAME);
 
-  /*
-   * Metrics indexes.
-   */
+  // Analytics performance indexes
   try {
-
-    await metricsCollection.createIndex({
-      createdAt: 1
-    });
-
     await metricsCollection.createIndex({
       createdAt: -1
     });
-
-  } catch (error) {
-
+  } catch (err) {
     console.log(
-      '⚠️ Metrics index warning:',
-      error.message
+      '⚠️ Metrics index:',
+      err.message
     );
+  }
 
+  try {
+    await collection.createIndex({
+      updatedAt: -1
+    });
+  } catch (err) {
+    console.log(
+      '⚠️ Session updatedAt index:',
+      err.message
+    );
   }
 
   console.log(
@@ -108,9 +89,272 @@ async function connectDB() {
   );
 }
 
+/* =========================================================
+   HELPER: accessKey -> bot number
+========================================================= */
+
+async function resolveNumberByKey(key) {
+  const doc = await collection.findOne(
+    {
+      'config.accessKey': key
+    },
+    {
+      projection: {
+        number: 1
+      }
+    }
+  );
+
+  return doc ? doc.number : null;
+}
 
 /* =========================================================
-   EXPRESS
+   HELPER: BOOLEAN CONFIG
+========================================================= */
+
+function configBoolean(value) {
+  return (
+    value === true ||
+    value === 'true'
+  );
+}
+
+/* =========================================================
+   HELPER: MODE
+========================================================= */
+
+function normalizeMode(value) {
+  const mode =
+    String(value || '')
+      .trim()
+      .toUpperCase();
+
+  return mode === 'PUBLIC'
+    ? 'PUBLIC'
+    : 'PRIVATE';
+}
+
+/* =========================================================
+   HELPER: ONLINE + TOTAL COUNT
+========================================================= */
+
+async function getOnlineAndTotal() {
+  if (!collection) {
+    throw new Error(
+      'Database not ready'
+    );
+  }
+
+  const thresholdDate =
+    new Date(
+      Date.now() -
+      ONLINE_THRESHOLD_MINUTES *
+      60 *
+      1000
+    );
+
+  const [onlineCount, totalCount] =
+    await Promise.all([
+      collection.countDocuments({
+        [TIMESTAMP_FIELD]: {
+          $gte: thresholdDate
+        }
+      }),
+
+      collection.countDocuments({})
+    ]);
+
+  const percentage =
+    totalCount > 0
+      ? Number(
+          (
+            (onlineCount / totalCount) *
+            100
+          ).toFixed(2)
+        )
+      : 0;
+
+  return {
+    online: onlineCount,
+    total: totalCount,
+    percentage
+  };
+}
+
+/* =========================================================
+   HELPER: SAVE ANALYTICS SNAPSHOT
+========================================================= */
+
+async function saveMetricsSnapshot() {
+  try {
+    if (!collection || !metricsCollection) {
+      return;
+    }
+
+    const stats =
+      await getOnlineAndTotal();
+
+    await metricsCollection.insertOne({
+      createdAt: new Date(),
+
+      online: stats.online,
+
+      total: stats.total,
+
+      percentage: stats.percentage
+    });
+
+    console.log(
+      `📊 Metrics saved -> ${stats.online}/${stats.total} (${stats.percentage}%)`
+    );
+  } catch (err) {
+    console.error(
+      '⚠️ Metrics snapshot error:',
+      err.message
+    );
+  }
+}
+
+/* =========================================================
+   HELPER: ANALYTICS HISTORY
+========================================================= */
+
+async function getAnalyticsHistory(hours = 24) {
+  if (!metricsCollection) {
+    throw new Error(
+      'Metrics database not ready'
+    );
+  }
+
+  hours = Number(hours);
+
+  if (!Number.isFinite(hours)) {
+    hours = 24;
+  }
+
+  hours = Math.min(
+    Math.max(hours, 1),
+    168
+  );
+
+  const since =
+    new Date(
+      Date.now() -
+      hours * 60 * 60 * 1000
+    );
+
+  const docs =
+    await metricsCollection
+      .find({
+        createdAt: {
+          $gte: since
+        }
+      })
+      .sort({
+        createdAt: 1
+      })
+      .toArray();
+
+  /*
+    24h -> 5 minute buckets
+
+    This prevents the chart from becoming
+    too heavy while still keeping good detail.
+  */
+
+  const bucketSize =
+    hours <= 24
+      ? 5 * 60 * 1000
+      : 15 * 60 * 1000;
+
+  const buckets = new Map();
+
+  for (const doc of docs) {
+    const time =
+      new Date(doc.createdAt)
+        .getTime();
+
+    if (!Number.isFinite(time)) {
+      continue;
+    }
+
+    const bucket =
+      Math.floor(
+        time / bucketSize
+      ) * bucketSize;
+
+    if (!buckets.has(bucket)) {
+      buckets.set(bucket, {
+        time: new Date(bucket),
+
+        onlineValues: [],
+
+        totalValues: [],
+
+        percentageValues: []
+      });
+    }
+
+    const item =
+      buckets.get(bucket);
+
+    item.onlineValues.push(
+      Number(doc.online || 0)
+    );
+
+    item.totalValues.push(
+      Number(doc.total || 0)
+    );
+
+    item.percentageValues.push(
+      Number(doc.percentage || 0)
+    );
+  }
+
+  const points = [];
+
+  for (const bucket of buckets.values()) {
+    const avg = arr =>
+      arr.length
+        ? arr.reduce(
+            (a, b) => a + b,
+            0
+          ) / arr.length
+        : 0;
+
+    points.push({
+      time:
+        bucket.time.toISOString(),
+
+      online:
+        Number(
+          avg(bucket.onlineValues)
+            .toFixed(2)
+        ),
+
+      total:
+        Number(
+          avg(bucket.totalValues)
+            .toFixed(2)
+        ),
+
+      percentage:
+        Number(
+          avg(
+            bucket.percentageValues
+          ).toFixed(2)
+        )
+    });
+  }
+
+  return {
+    hours,
+    points
+  };
+}
+
+/* =========================================================
+   MIDDLEWARE
 ========================================================= */
 
 app.use(
@@ -119,221 +363,216 @@ app.use(
   })
 );
 
-
 /* =========================================================
-   HELPERS
-========================================================= */
-
-function cleanString(
-  value,
-  fallback = ''
-) {
-
-  if (
-    typeof value !== 'string'
-  ) {
-    return fallback;
-  }
-
-  return value.trim();
-}
-
-
-function boolValue(
-  value
-) {
-
-  return (
-    value === true ||
-    value === 'true' ||
-    value === 1 ||
-    value === '1'
-  );
-
-}
-
-
-function normalizeMode(
-  value
-) {
-
-  const mode =
-    String(
-      value || DEFAULT_MODE
-    )
-      .trim()
-      .toUpperCase();
-
-  return mode === 'PRIVATE'
-    ? 'PRIVATE'
-    : 'PUBLIC';
-
-}
-
-
-function getOnlineDate() {
-
-  return new Date(
-    Date.now() -
-    ONLINE_THRESHOLD_MINUTES *
-    60 *
-    1000
-  );
-
-}
-
-
-/* =========================================================
-   ONLINE STATS
-========================================================= */
-
-async function getStats() {
-
-  if (!collection) {
-    throw new Error(
-      'Database ready naha'
-    );
-  }
-
-  const thresholdDate =
-    getOnlineDate();
-
-  const [
-    onlineCount,
-    totalCount
-  ] =
-    await Promise.all([
-
-      collection.countDocuments({
-
-        [TIMESTAMP_FIELD]: {
-          $gte: thresholdDate
-        }
-
-      }),
-
-      collection.countDocuments({})
-
-    ]);
-
-  const offlineCount =
-    Math.max(
-      totalCount -
-      onlineCount,
-      0
-    );
-
-  const percentage =
-    totalCount > 0
-
-      ? Number(
-          (
-            (
-              onlineCount /
-              totalCount
-            ) * 100
-          ).toFixed(1)
-        )
-
-      : 0;
-
-  return {
-
-    online:
-      onlineCount,
-
-    total:
-      totalCount,
-
-    offline:
-      offlineCount,
-
-    percentage,
-
-    thresholdMinutes:
-      ONLINE_THRESHOLD_MINUTES,
-
-    time:
-      new Date().toISOString()
-
-  };
-
-}
-
-
-/* =========================================================
-   LIVE STATS API
+   ONLINE COUNT API
 ========================================================= */
 
 app.get(
   '/api/online-count',
   async (req, res) => {
-
     try {
+      if (!collection) {
+        return res.status(503).json({
+          error:
+            'Database ready naha'
+        });
+      }
 
       const stats =
-        await getStats();
+        await getOnlineAndTotal();
 
-      res.set(
-        'Cache-Control',
-        'no-store'
-      );
+      res.json({
+        online: stats.online,
 
-      res.json(
-        stats
-      );
+        total: stats.total,
+
+        percentage:
+          stats.percentage,
+
+        time:
+          new Date().toISOString()
+      });
 
     } catch (err) {
-
       console.error(
         '❌ Query error:',
         err.message
       );
 
       res.status(500).json({
-
         error:
           'Data ganna bari una'
-
       });
-
     }
-
   }
 );
 
+/* =========================================================
+   ANALYTICS API
+========================================================= */
+
+app.get(
+  '/api/analytics',
+  async (req, res) => {
+    try {
+      if (
+        !collection ||
+        !metricsCollection
+      ) {
+        return res.status(503).json({
+          error:
+            'Database ready naha'
+        });
+      }
+
+      const hours =
+        Number(
+          req.query.hours || 24
+        );
+
+      const history =
+        await getAnalyticsHistory(
+          hours
+        );
+
+      const current =
+        await getOnlineAndTotal();
+
+      const values =
+        history.points;
+
+      const onlineValues =
+        values.map(
+          x => Number(x.online || 0)
+        );
+
+      const totalValues =
+        values.map(
+          x => Number(x.total || 0)
+        );
+
+      const availabilityValues =
+        values.map(
+          x =>
+            Number(
+              x.percentage || 0
+            )
+        );
+
+      const average = arr =>
+        arr.length
+          ? arr.reduce(
+              (a, b) => a + b,
+              0
+            ) / arr.length
+          : 0;
+
+      const peakOnline =
+        onlineValues.length
+          ? Math.max(...onlineValues)
+          : current.online;
+
+      const minOnline =
+        onlineValues.length
+          ? Math.min(...onlineValues)
+          : current.online;
+
+      const maxTotal =
+        totalValues.length
+          ? Math.max(...totalValues)
+          : current.total;
+
+      const avgOnline =
+        average(onlineValues);
+
+      const avgTotal =
+        average(totalValues);
+
+      const avgAvailability =
+        average(
+          availabilityValues
+        );
+
+      res.json({
+        hours,
+
+        current: {
+          online: current.online,
+          total: current.total,
+          percentage:
+            current.percentage
+        },
+
+        summary: {
+          peakOnline,
+          minOnline,
+          maxTotal,
+
+          averageOnline:
+            Number(
+              avgOnline.toFixed(2)
+            ),
+
+          averageTotal:
+            Number(
+              avgTotal.toFixed(2)
+            ),
+
+          averageAvailability:
+            Number(
+              avgAvailability.toFixed(2)
+            ),
+
+          points:
+            values.length
+        },
+
+        points:
+          history.points,
+
+        time:
+          new Date().toISOString()
+      });
+
+    } catch (err) {
+      console.error(
+        '❌ Analytics error:',
+        err.message
+      );
+
+      res.status(500).json({
+        error:
+          'Analytics ganna bari una'
+      });
+    }
+  }
+);
 
 /* =========================================================
-   BOT SETTINGS GET
+   GET BOT SETTINGS
 ========================================================= */
 
 app.get(
   '/api/bot-settings/:key',
   async (req, res) => {
-
     try {
-
       if (!collection) {
-
         return res.status(503).json({
           error:
             'Database ready naha'
         });
-
       }
 
       const key =
-        cleanString(
-          req.params.key
-        );
+        String(
+          req.params.key || ''
+        ).trim();
 
       if (!key) {
-
         return res.status(400).json({
           error:
             'Access key eka denna'
         });
-
       }
 
       const doc =
@@ -342,12 +581,10 @@ app.get(
         });
 
       if (!doc) {
-
         return res.status(404).json({
           error:
             'Invalid access key'
         });
-
       }
 
       const cfg =
@@ -360,16 +597,28 @@ app.get(
 
       const maskedNumber =
         number.length > 6
-
           ? number.slice(0, 4) +
             '••••' +
             number.slice(-2)
-
           : 'N/A';
 
+      /*
+        MOVIE_CAPTION compatibility:
+        New -> MOVIE_CAPTION
+        Old -> MOVIE_FOOTER
+      */
+
+      const movieCaption =
+        cfg.MOVIE_CAPTION ||
+        cfg.MOVIE_FOOTER ||
+        '';
+
+      const movieFooter =
+        cfg.MOVIE_FOOTER ||
+        cfg.MOVIE_CAPTION ||
+        '';
 
       res.json({
-
         number:
           maskedNumber,
 
@@ -383,10 +632,10 @@ app.get(
           cfg.BOT_FOOTER || '',
 
         MOVIE_FOOTER:
-          cfg.MOVIE_FOOTER || '',
+          movieFooter,
 
         MOVIE_CAPTION:
-          cfg.MOVIE_CAPTION || '',
+          movieCaption,
 
         MODE:
           normalizeMode(
@@ -394,36 +643,34 @@ app.get(
           ),
 
         ALWAYS_ONLINE:
-          boolValue(
+          configBoolean(
             cfg.ALWAYS_ONLINE
           ),
 
         ALWAYS_MSG_SEEN:
-          boolValue(
+          configBoolean(
             cfg.ALWAYS_MSG_SEEN
           ),
 
         STATUS_VIEW:
-          boolValue(
+          configBoolean(
             cfg.STATUS_VIEW
           ),
 
         AUTO_LIKE:
-          boolValue(
+          configBoolean(
             cfg.AUTO_LIKE
           ),
 
         ANTI_DELETE:
-          boolValue(
+          configBoolean(
             cfg.ANTI_DELETE
           )
-
       });
 
     } catch (err) {
-
       console.error(
-        '❌ settings GET:',
+        '❌ bot-settings GET error:',
         err.message
       );
 
@@ -431,45 +678,51 @@ app.get(
         error:
           'Data ganna bari una'
       });
-
     }
-
   }
 );
 
-
 /* =========================================================
-   BOT SETTINGS SAVE
+   SAVE BOT SETTINGS
 ========================================================= */
 
 app.post(
   '/api/bot-settings/:key',
   async (req, res) => {
-
     try {
-
       if (!collection) {
-
         return res.status(503).json({
           error:
             'Database ready naha'
         });
-
       }
 
       const key =
-        cleanString(
-          req.params.key
-        );
+        String(
+          req.params.key || ''
+        ).trim();
 
       if (!key) {
-
         return res.status(400).json({
           error:
             'Access key eka denna'
         });
-
       }
+
+      const {
+        BOT_NAME,
+        BOT_IMAGE,
+        BOT_FOOTER,
+        MOVIE_FOOTER,
+        MOVIE_CAPTION,
+        MODE,
+
+        ALWAYS_ONLINE,
+        ALWAYS_MSG_SEEN,
+        STATUS_VIEW,
+        AUTO_LIKE,
+        ANTI_DELETE
+      } = req.body || {};
 
       const doc =
         await collection.findOne({
@@ -477,208 +730,203 @@ app.post(
         });
 
       if (!doc) {
-
         return res.status(404).json({
           error:
             'Invalid access key'
         });
-
       }
-
-      const body =
-        req.body || {};
 
       const update = {};
 
-
       if (
-        typeof body.BOT_NAME ===
+        typeof BOT_NAME ===
         'string'
       ) {
-
         update[
           'config.BOT_NAME'
         ] =
-          body.BOT_NAME.trim();
-
+          BOT_NAME.trim();
       }
 
-
       if (
-        typeof body.BOT_IMAGE ===
+        typeof BOT_IMAGE ===
         'string'
       ) {
-
         update[
           'config.BOT_IMAGE'
         ] =
-          body.BOT_IMAGE.trim();
-
+          BOT_IMAGE.trim();
       }
 
-
       if (
-        typeof body.BOT_FOOTER ===
+        typeof BOT_FOOTER ===
         'string'
       ) {
-
         update[
           'config.BOT_FOOTER'
         ] =
-          body.BOT_FOOTER.trim();
-
+          BOT_FOOTER.trim();
       }
 
+      /*
+        MOVIE CAPTION
+
+        If MOVIE_CAPTION is supplied,
+        save it to both fields for compatibility.
+
+        If old frontend sends MOVIE_FOOTER,
+        also save it to MOVIE_CAPTION.
+      */
 
       if (
-        typeof body.MOVIE_FOOTER ===
+        typeof MOVIE_CAPTION ===
         'string'
       ) {
-
-        update[
-          'config.MOVIE_FOOTER'
-        ] =
-          body.MOVIE_FOOTER.trim();
-
-      }
-
-
-      if (
-        typeof body.MOVIE_CAPTION ===
-        'string'
-      ) {
+        const caption =
+          MOVIE_CAPTION.trim();
 
         update[
           'config.MOVIE_CAPTION'
-        ] =
-          body.MOVIE_CAPTION.trim();
+        ] = caption;
 
-      }
+        update[
+          'config.MOVIE_FOOTER'
+        ] = caption;
 
-
-      if (
-        typeof body.MODE ===
+      } else if (
+        typeof MOVIE_FOOTER ===
         'string'
       ) {
+        const footer =
+          MOVIE_FOOTER.trim();
 
+        update[
+          'config.MOVIE_FOOTER'
+        ] = footer;
+
+        update[
+          'config.MOVIE_CAPTION'
+        ] = footer;
+      }
+
+      /* =====================================================
+         MODE
+      ===================================================== */
+
+      if (
+        typeof MODE ===
+        'string'
+      ) {
         update[
           'config.MODE'
         ] =
           normalizeMode(
-            body.MODE
+            MODE
           );
-
       }
 
+      /* =====================================================
+         TOGGLES
+      ===================================================== */
 
       if (
-        typeof body.ALWAYS_ONLINE ===
+        typeof ALWAYS_ONLINE ===
         'boolean'
       ) {
-
         update[
           'config.ALWAYS_ONLINE'
         ] =
-          body.ALWAYS_ONLINE
+          ALWAYS_ONLINE
             ? 'true'
             : 'false';
-
       }
 
-
       if (
-        typeof body.ALWAYS_MSG_SEEN ===
+        typeof ALWAYS_MSG_SEEN ===
         'boolean'
       ) {
-
         update[
           'config.ALWAYS_MSG_SEEN'
         ] =
-          body.ALWAYS_MSG_SEEN
+          ALWAYS_MSG_SEEN
             ? 'true'
             : 'false';
-
       }
 
-
       if (
-        typeof body.STATUS_VIEW ===
+        typeof STATUS_VIEW ===
         'boolean'
       ) {
-
         update[
           'config.STATUS_VIEW'
         ] =
-          body.STATUS_VIEW
+          STATUS_VIEW
             ? 'true'
             : 'false';
-
       }
 
-
       if (
-        typeof body.AUTO_LIKE ===
+        typeof AUTO_LIKE ===
         'boolean'
       ) {
-
         update[
           'config.AUTO_LIKE'
         ] =
-          body.AUTO_LIKE
+          AUTO_LIKE
             ? 'true'
             : 'false';
-
       }
 
-
       if (
-        typeof body.ANTI_DELETE ===
+        typeof ANTI_DELETE ===
         'boolean'
       ) {
-
         update[
           'config.ANTI_DELETE'
         ] =
-          body.ANTI_DELETE
+          ANTI_DELETE
             ? 'true'
             : 'false';
-
       }
 
+      /*
+        IMPORTANT:
+        pair.js optimized sync එකට
+        මේ updatedAt value එක තමයි detect කරන්නේ.
+      */
 
       update.updatedAt =
         new Date();
 
-
       await collection.updateOne(
-
         {
           'config.accessKey':
             key
         },
-
         {
-          $set:
-            update
+          $set: update
         }
-
       );
 
-
       res.json({
-
-        success:
-          true,
+        success: true,
 
         message:
-          'Bot settings saved'
+          'Bot settings saved',
 
+        mode:
+          update[
+            'config.MODE'
+          ] || undefined,
+
+        updatedAt:
+          update.updatedAt
+            .toISOString()
       });
 
     } catch (err) {
-
       console.error(
-        '❌ settings POST:',
+        '❌ bot-settings POST error:',
         err.message
       );
 
@@ -686,273 +934,2432 @@ app.post(
         error:
           'Save karanna bari una'
       });
-
     }
-
   }
 );
 
-
 /* =========================================================
-   ANALYTICS SNAPSHOT
-========================================================= */
-
-async function saveMetricsSnapshot() {
-
-  try {
-
-    if (
-      !collection ||
-      !metricsCollection
-    ) {
-      return;
-    }
-
-    const stats =
-      await getStats();
-
-    await metricsCollection.insertOne({
-
-      createdAt:
-        new Date(),
-
-      online:
-        stats.online,
-
-      total:
-        stats.total,
-
-      offline:
-        stats.offline,
-
-      percentage:
-        stats.percentage
-
-    });
-
-  } catch (error) {
-
-    console.error(
-      '⚠️ Metrics snapshot:',
-      error.message
-    );
-
-  }
-
-}
-
-
-/* =========================================================
-   ANALYTICS API
+   AUTO-REPLY MANAGEMENT
 ========================================================= */
 
 app.get(
-  '/api/analytics',
+  '/api/auto-replies/:key',
   async (req, res) => {
-
     try {
-
-      if (!metricsCollection) {
-
+      if (
+        !collection ||
+        !autoRepliesCollection
+      ) {
         return res.status(503).json({
           error:
-            'Metrics database ready naha'
+            'Database ready naha'
         });
-
       }
 
-      const hours =
-        Math.min(
-          Math.max(
-            Number(
-              req.query.hours || 24
-            ),
-            1
-          ),
-          168
+      const key =
+        String(
+          req.params.key || ''
+        ).trim();
+
+      const number =
+        await resolveNumberByKey(
+          key
         );
 
-      const since =
-        new Date(
-          Date.now() -
-          hours *
-          60 *
-          60 *
-          1000
-        );
+      if (!number) {
+        return res.status(404).json({
+          error:
+            'Invalid access key'
+        });
+      }
 
-
-      const rows =
-        await metricsCollection
-          .find({
-            createdAt: {
-              $gte: since
-            }
-          })
+      const rules =
+        await autoRepliesCollection
+          .find({ number })
           .sort({
-            createdAt: 1
+            createdAt: -1
           })
           .toArray();
 
-
-      /*
-       * Group data by minute.
-       * This keeps chart clean even if
-       * more snapshots are stored.
-       */
-
-      const grouped =
-        new Map();
-
-
-      for (
-        const row of rows
-      ) {
-
-        const date =
-          new Date(
-            row.createdAt
-          );
-
-        date.setSeconds(
-          0,
-          0
-        );
-
-        const key =
-          date.toISOString();
-
-
-        grouped.set(
-          key,
-          {
-
-            time:
-              key,
-
-            online:
-              Number(
-                row.online || 0
-              ),
-
-            total:
-              Number(
-                row.total || 0
-              ),
-
-            offline:
-              Number(
-                row.offline || 0
-              ),
-
-            percentage:
-              Number(
-                row.percentage || 0
-              )
-
-          }
-        );
-
-      }
-
-
-      const data =
-        Array.from(
-          grouped.values()
-        );
-
-
-      res.set(
-        'Cache-Control',
-        'no-store'
-      );
-
-
       res.json({
+        rules:
+          rules.map(r => ({
+            keyword:
+              r.keyword,
 
-        hours,
+            reply:
+              r.reply || '',
 
-        count:
-          data.length,
-
-        data
-
+            image:
+              r.image || ''
+          }))
       });
 
-    } catch (error) {
-
+    } catch (err) {
       console.error(
-        '❌ Analytics error:',
-        error.message
+        '❌ auto-replies GET error:',
+        err.message
       );
 
       res.status(500).json({
         error:
-          'Analytics ganna bari una'
+          'Data ganna bari una'
+      });
+    }
+  }
+);
+
+app.post(
+  '/api/auto-replies/:key',
+  async (req, res) => {
+    try {
+      if (
+        !collection ||
+        !autoRepliesCollection
+      ) {
+        return res.status(503).json({
+          error:
+            'Database ready naha'
+        });
+      }
+
+      const key =
+        String(
+          req.params.key || ''
+        ).trim();
+
+      const number =
+        await resolveNumberByKey(
+          key
+        );
+
+      if (!number) {
+        return res.status(404).json({
+          error:
+            'Invalid access key'
+        });
+      }
+
+      const {
+        keyword,
+        reply,
+        image
+      } = req.body || {};
+
+      const cleanKeyword =
+        String(
+          keyword || ''
+        )
+          .trim()
+          .toLowerCase();
+
+      if (!cleanKeyword) {
+        return res.status(400).json({
+          error:
+            'Keyword eka danna'
+        });
+      }
+
+      if (!reply && !image) {
+        return res.status(400).json({
+          error:
+            'Reply text ekak nathnam image ekak witharath danna'
+        });
+      }
+
+      await autoRepliesCollection.updateOne(
+        {
+          number,
+          keyword:
+            cleanKeyword
+        },
+        {
+          $set: {
+            number,
+
+            keyword:
+              cleanKeyword,
+
+            reply:
+              String(
+                reply || ''
+              ).trim(),
+
+            image:
+              String(
+                image || ''
+              ).trim(),
+
+            createdAt:
+              new Date()
+          }
+        },
+        {
+          upsert: true
+        }
+      );
+
+      res.json({
+        success: true,
+        message:
+          'Auto-reply saved'
       });
 
+    } catch (err) {
+      console.error(
+        '❌ auto-replies POST error:',
+        err.message
+      );
+
+      res.status(500).json({
+        error:
+          'Save karanna bari una'
+      });
+    }
+  }
+);
+
+app.delete(
+  '/api/auto-replies/:key/:keyword',
+  async (req, res) => {
+    try {
+      if (
+        !collection ||
+        !autoRepliesCollection
+      ) {
+        return res.status(503).json({
+          error:
+            'Database ready naha'
+        });
+      }
+
+      const key =
+        String(
+          req.params.key || ''
+        ).trim();
+
+      const number =
+        await resolveNumberByKey(
+          key
+        );
+
+      if (!number) {
+        return res.status(404).json({
+          error:
+            'Invalid access key'
+        });
+      }
+
+      const keyword =
+        String(
+          req.params.keyword || ''
+        )
+          .trim()
+          .toLowerCase();
+
+      const result =
+        await autoRepliesCollection
+          .deleteOne({
+            number,
+            keyword
+          });
+
+      res.json({
+        success: true,
+
+        deleted:
+          result.deletedCount > 0
+      });
+
+    } catch (err) {
+      console.error(
+        '❌ auto-replies DELETE error:',
+        err.message
+      );
+
+      res.status(500).json({
+        error:
+          'Delete karanna bari una'
+      });
+    }
+  }
+);
+
+/* =========================================================
+   MANAGE PAGE
+========================================================= */
+
+app.get(
+  '/manage',
+  (req, res) => {
+
+    res.set(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, proxy-revalidate'
+    );
+
+    res.send(`<!DOCTYPE html>
+<html lang="si">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Bot Settings - Manage</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --green: #25d366;
+  --blue: #60a5fa;
+  --purple: #a78bfa;
+  --red: #f87171;
+  --bg: #050b14;
+  --card: rgba(255,255,255,.055);
+  --border: rgba(255,255,255,.09);
+}
+
+body {
+
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
+
+  background:
+
+    radial-gradient(
+      circle at 10% 10%,
+      rgba(37,211,102,.10),
+      transparent 30%
+    ),
+
+    radial-gradient(
+      circle at 90% 20%,
+      rgba(96,165,250,.12),
+      transparent 30%
+    ),
+
+    radial-gradient(
+      circle at 50% 100%,
+      rgba(167,139,250,.10),
+      transparent 35%
+    ),
+
+    linear-gradient(
+      135deg,
+      #020617,
+      #0b1120 50%,
+      #111827
+    );
+
+  color: #e5e7eb;
+  min-height: 100vh;
+  padding: 25px 15px;
+
+  overflow-x: hidden;
+}
+
+/* =========================================================
+   INTRO LOADER
+========================================================= */
+
+#introLoader {
+
+  position: fixed;
+  inset: 0;
+
+  z-index: 99999;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background:
+    radial-gradient(
+      circle,
+      #172554,
+      #020617 70%
+    );
+
+  transition:
+    opacity .7s ease,
+    visibility .7s ease;
+}
+
+#introLoader.hide {
+
+  opacity: 0;
+  visibility: hidden;
+}
+
+.loaderBox {
+
+  text-align: center;
+
+  animation:
+    loaderFloat 2s ease-in-out infinite;
+}
+
+.loaderLogo {
+
+  width: 75px;
+  height: 75px;
+
+  border-radius: 24px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  margin: auto;
+
+  font-size: 38px;
+
+  background:
+    linear-gradient(
+      135deg,
+      #25d366,
+      #60a5fa
+    );
+
+  box-shadow:
+    0 0 50px
+    rgba(37,211,102,.25);
+}
+
+.loaderText {
+
+  margin-top: 16px;
+
+  font-size: 15px;
+
+  font-weight: 800;
+
+  letter-spacing: 1px;
+
+  color: #e2e8f0;
+}
+
+.loaderBar {
+
+  width: 180px;
+  height: 4px;
+
+  margin: 16px auto 0;
+
+  border-radius: 20px;
+
+  overflow: hidden;
+
+  background:
+    rgba(255,255,255,.08);
+}
+
+.loaderBar span {
+
+  display: block;
+
+  width: 45%;
+
+  height: 100%;
+
+  border-radius: inherit;
+
+  background:
+    linear-gradient(
+      90deg,
+      #25d366,
+      #60a5fa,
+      #a78bfa
+    );
+
+  animation:
+    loadingBar 1.2s infinite ease-in-out;
+}
+
+@keyframes loadingBar {
+
+  0% {
+    transform: translateX(-120%);
+  }
+
+  100% {
+    transform: translateX(430%);
+  }
+}
+
+@keyframes loaderFloat {
+
+  0%,100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+/* =========================================================
+   MAIN
+========================================================= */
+
+.wrap {
+
+  max-width: 1080px;
+
+  margin: auto;
+
+  position: relative;
+
+  z-index: 2;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* =========================================================
+   HEADER
+========================================================= */
+
+.header {
+
+  margin-bottom: 22px;
+
+  animation:
+    fadeUp .7s ease;
+}
+
+h1 {
+
+  font-size: 28px;
+
+  font-weight: 900;
+
+  background:
+    linear-gradient(
+      90deg,
+      #25d366,
+      #60a5fa,
+      #a78bfa
+    );
+
+  -webkit-background-clip: text;
+  background-clip: text;
+
+  color: transparent;
+}
+
+.sub {
+
+  color: #94a3b8;
+
+  font-size: 13px;
+
+  margin-top: 6px;
+}
+
+/* =========================================================
+   CARDS
+========================================================= */
+
+.card {
+
+  background:
+    linear-gradient(
+      145deg,
+      rgba(255,255,255,.075),
+      rgba(255,255,255,.025)
+    );
+
+  border:
+    1px solid
+    rgba(255,255,255,.09);
+
+  border-radius: 20px;
+
+  padding: 20px;
+
+  backdrop-filter:
+    blur(18px);
+
+  -webkit-backdrop-filter:
+    blur(18px);
+
+  box-shadow:
+    0 25px 70px
+    rgba(0,0,0,.30);
+
+  margin-bottom: 16px;
+
+  animation:
+    fadeUp .7s ease;
+}
+
+.card:hover {
+
+  border-color:
+    rgba(96,165,250,.18);
+}
+
+.card-title {
+
+  font-size: 17px;
+
+  font-weight: 800;
+
+  margin-bottom: 5px;
+}
+
+.card-sub {
+
+  color: #94a3b8;
+
+  font-size: 12px;
+
+  margin-bottom: 18px;
+}
+
+/* =========================================================
+   LOGIN
+========================================================= */
+
+.login-card {
+
+  max-width: 500px;
+
+  margin:
+    70px auto 20px;
+}
+
+label {
+
+  display: block;
+
+  font-size: 12px;
+
+  color: #94a3b8;
+
+  margin-top: 15px;
+
+  margin-bottom: 7px;
+}
+
+input {
+
+  width: 100%;
+
+  padding: 13px 14px;
+
+  border-radius: 12px;
+
+  border:
+    1px solid
+    rgba(255,255,255,.11);
+
+  background:
+    rgba(0,0,0,.28);
+
+  color: #f8fafc;
+
+  font-size: 14px;
+
+  transition:
+    .2s ease;
+}
+
+input:focus {
+
+  outline: none;
+
+  border-color:
+    #25d366;
+
+  box-shadow:
+    0 0 0 4px
+    rgba(37,211,102,.07);
+}
+
+button {
+
+  width: 100%;
+
+  margin-top: 18px;
+
+  padding: 13px;
+
+  border: none;
+
+  border-radius: 12px;
+
+  background:
+    linear-gradient(
+      90deg,
+      #25d366,
+      #60a5fa
+    );
+
+  color: #03110b;
+
+  font-size: 14px;
+
+  font-weight: 900;
+
+  cursor: pointer;
+
+  transition:
+    .2s ease;
+}
+
+button:hover {
+
+  transform:
+    translateY(-2px);
+
+  filter:
+    brightness(1.08);
+
+  box-shadow:
+    0 12px 30px
+    rgba(37,211,102,.12);
+}
+
+button:disabled {
+
+  opacity: .55;
+
+  cursor: not-allowed;
+
+  transform: none;
+
+  box-shadow: none;
+}
+
+/* =========================================================
+   BOT NUMBER
+========================================================= */
+
+.botnum {
+
+  background:
+    rgba(37,211,102,.07);
+
+  border:
+    1px solid
+    rgba(37,211,102,.15);
+
+  color: #34d399;
+
+  padding: 10px 12px;
+
+  border-radius: 10px;
+
+  font-size: 12px;
+
+  margin-bottom: 16px;
+}
+
+/* =========================================================
+   SECTIONS
+========================================================= */
+
+.section-title {
+
+  font-size: 12px;
+
+  font-weight: 900;
+
+  color: #60a5fa;
+
+  margin-top: 24px;
+
+  margin-bottom: 5px;
+
+  text-transform: uppercase;
+
+  letter-spacing: 1px;
+}
+
+/* =========================================================
+   MODE SELECTOR
+========================================================= */
+
+.mode-grid {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(2, minmax(0, 1fr));
+
+  gap: 12px;
+
+  margin-top: 12px;
+}
+
+.mode-card {
+
+  position: relative;
+
+  padding: 17px;
+
+  border-radius: 16px;
+
+  border:
+    1px solid
+    rgba(255,255,255,.10);
+
+  background:
+    rgba(255,255,255,.035);
+
+  cursor: pointer;
+
+  transition:
+    .25s ease;
+}
+
+.mode-card:hover {
+
+  transform:
+    translateY(-2px);
+
+  background:
+    rgba(255,255,255,.06);
+}
+
+.mode-card.active.public {
+
+  border-color:
+    rgba(37,211,102,.65);
+
+  background:
+    rgba(37,211,102,.08);
+
+  box-shadow:
+    0 0 35px
+    rgba(37,211,102,.08);
+}
+
+.mode-card.active.private {
+
+  border-color:
+    rgba(167,139,250,.65);
+
+  background:
+    rgba(167,139,250,.08);
+
+  box-shadow:
+    0 0 35px
+    rgba(167,139,250,.08);
+}
+
+.mode-icon {
+
+  font-size: 28px;
+
+  margin-bottom: 8px;
+}
+
+.mode-name {
+
+  font-size: 14px;
+
+  font-weight: 900;
+}
+
+.mode-description {
+
+  color: #94a3b8;
+
+  font-size: 11px;
+
+  margin-top: 4px;
+
+  line-height: 1.5;
+}
+
+.mode-check {
+
+  position: absolute;
+
+  top: 13px;
+
+  right: 13px;
+
+  width: 22px;
+
+  height: 22px;
+
+  border-radius: 50%;
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content: center;
+
+  font-size: 11px;
+
+  opacity: 0;
+
+  background:
+    #25d366;
+
+  color: #02140a;
+}
+
+.mode-card.active .mode-check {
+
+  opacity: 1;
+}
+
+/* =========================================================
+   TOGGLES
+========================================================= */
+
+.toggle-row {
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content: space-between;
+
+  gap: 15px;
+
+  padding: 13px 14px;
+
+  background:
+    rgba(255,255,255,.035);
+
+  border:
+    1px solid
+    rgba(255,255,255,.07);
+
+  border-radius: 13px;
+
+  margin-top: 10px;
+}
+
+.label-text {
+
+  font-size: 13px;
+
+  color: #e5e7eb;
+
+  font-weight: 600;
+}
+
+.label-sub {
+
+  font-size: 11px;
+
+  color: #94a3b8;
+
+  margin-top: 2px;
+}
+
+.switch {
+
+  position: relative;
+
+  width: 46px;
+
+  height: 26px;
+
+  flex-shrink: 0;
+}
+
+.switch input {
+
+  opacity: 0;
+
+  width: 0;
+
+  height: 0;
+}
+
+.slider {
+
+  position: absolute;
+
+  cursor: pointer;
+
+  inset: 0;
+
+  background:
+    rgba(255,255,255,.14);
+
+  transition:
+    .2s;
+
+  border-radius: 26px;
+}
+
+.slider:before {
+
+  position: absolute;
+
+  content: "";
+
+  height: 20px;
+
+  width: 20px;
+
+  left: 3px;
+
+  bottom: 3px;
+
+  background:
+    white;
+
+  transition:
+    .2s;
+
+  border-radius: 50%;
+}
+
+.switch input:checked + .slider {
+
+  background:
+    #25d366;
+}
+
+.switch input:checked + .slider:before {
+
+  transform:
+    translateX(20px);
+}
+
+/* =========================================================
+   MESSAGES
+========================================================= */
+
+.msg {
+
+  display: none;
+
+  margin-top: 12px;
+
+  font-size: 13px;
+}
+
+.msg.ok {
+  color: #34d399;
+}
+
+.msg.err {
+  color: #f87171;
+}
+
+/* =========================================================
+   MODE STATUS
+========================================================= */
+
+.mode-status {
+
+  margin-top: 14px;
+
+  padding: 13px;
+
+  border-radius: 13px;
+
+  border:
+    1px solid
+    rgba(255,255,255,.08);
+
+  font-size: 12px;
+
+  transition:
+    .3s ease;
+}
+
+.mode-status.public {
+
+  background:
+    rgba(37,211,102,.07);
+
+  color: #34d399;
+
+  border-color:
+    rgba(37,211,102,.18);
+}
+
+.mode-status.private {
+
+  background:
+    rgba(167,139,250,.07);
+
+  color: #c4b5fd;
+
+  border-color:
+    rgba(167,139,250,.18);
+}
+
+/* =========================================================
+   AUTO REPLY
+========================================================= */
+
+.ar-item {
+
+  display: flex;
+
+  align-items: center;
+
+  gap: 10px;
+
+  background:
+    rgba(255,255,255,.035);
+
+  border:
+    1px solid
+    rgba(255,255,255,.08);
+
+  border-radius: 12px;
+
+  padding: 10px 12px;
+
+  margin-top: 8px;
+}
+
+.ar-delete {
+
+  width: auto;
+
+  margin: 0;
+
+  padding: 8px 12px;
+
+  background:
+    rgba(248,113,113,.12);
+
+  color: #f87171;
+
+  font-size: 12px;
+
+  box-shadow: none;
+}
+
+/* =========================================================
+   ANIMATION
+========================================================= */
+
+@keyframes fadeUp {
+
+  from {
+
+    opacity: 0;
+
+    transform:
+      translateY(14px);
+  }
+
+  to {
+
+    opacity: 1;
+
+    transform:
+      translateY(0);
+  }
+}
+
+/* =========================================================
+   RESPONSIVE
+========================================================= */
+
+@media(max-width:650px) {
+
+  body {
+    padding: 18px 11px;
+  }
+
+  h1 {
+    font-size: 23px;
+  }
+
+  .card {
+    padding: 16px;
+    border-radius: 17px;
+  }
+
+  .mode-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+</style>
+</head>
+
+<body>
+
+<!-- INTRO -->
+<div id="introLoader">
+  <div class="loaderBox">
+    <div class="loaderLogo">🤖</div>
+    <div class="loaderText">
+      SHAGGY BOT CONTROL
+    </div>
+    <div class="loaderBar">
+      <span></span>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="header">
+
+    <h1>
+      🤖 Bot Control Center
+    </h1>
+
+    <div class="sub">
+      Access key eken login wela oyage bot settings manage karanna.
+    </div>
+
+  </div>
+
+  <!-- LOGIN -->
+
+  <div
+    class="card login-card"
+    id="loginCard"
+  >
+
+    <div class="card-title">
+      🔐 Access Key Login
+    </div>
+
+    <div class="card-sub">
+      Oyage bot access key eka enter karanna.
+    </div>
+
+    <label>
+      Access Key
+    </label>
+
+    <input
+      id="keyInput"
+      placeholder="e.g. A1B2C3D4E5"
+      autocomplete="off"
+      autocapitalize="characters"
+    >
+
+    <button id="loginBtn">
+      🔓 Login
+    </button>
+
+    <div
+      class="msg err"
+      id="loginMsg"
+    ></div>
+
+  </div>
+
+  <!-- DASHBOARD -->
+
+  <div
+    class="hidden"
+    id="dashboard"
+  >
+
+    <!-- BOT INFO -->
+
+    <div class="card">
+
+      <div
+        class="botnum"
+        id="botNum"
+      >
+        Bot: N/A
+      </div>
+
+      <div class="section-title">
+        🎨 Bot Identity
+      </div>
+
+      <label>
+        Bot Name
+      </label>
+
+      <input
+        id="botName"
+        placeholder="e.g. SHAGGY XMD"
+        autocomplete="off"
+      >
+
+      <label>
+        Bot Image URL
+      </label>
+
+      <input
+        id="botImage"
+        placeholder="https://example.com/bot.jpg"
+        autocomplete="off"
+      >
+
+      <label>
+        Bot Footer Text
+      </label>
+
+      <input
+        id="botFooter"
+        placeholder="e.g. POWERED BY SHAGGY"
+        autocomplete="off"
+      >
+
+      <label>
+        Movie Caption
+      </label>
+
+      <input
+        id="movieCaption"
+        placeholder="e.g. 🎬 SHAGGY XMD MOVIE"
+        autocomplete="off"
+      >
+
+      <div class="section-title">
+        🔐 Bot Mode
+      </div>
+
+      <div class="mode-grid">
+
+        <div
+          class="mode-card public"
+          id="publicMode"
+          data-mode="PUBLIC"
+        >
+
+          <div class="mode-icon">
+            🌐
+          </div>
+
+          <div class="mode-name">
+            PUBLIC MODE
+          </div>
+
+          <div class="mode-description">
+            Public bot mode.
+            Dashboard eke public state
+            pennanawa.
+          </div>
+
+          <div class="mode-check">
+            ✓
+          </div>
+
+        </div>
+
+        <div
+          class="mode-card private"
+          id="privateMode"
+          data-mode="PRIVATE"
+        >
+
+          <div class="mode-icon">
+            🔒
+          </div>
+
+          <div class="mode-name">
+            PRIVATE MODE
+          </div>
+
+          <div class="mode-description">
+            Private bot mode.
+            Dashboard eke private state
+            pennanawa.
+          </div>
+
+          <div class="mode-check">
+            ✓
+          </div>
+
+        </div>
+
+      </div>
+
+      <div
+        id="modeStatus"
+        class="mode-status private"
+      >
+        🔒 Private Mode selected
+      </div>
+
+      <div class="section-title">
+        ⚙️ Behaviour Toggles
+      </div>
+
+      <div class="toggle-row">
+
+        <div>
+          <div class="label-text">
+            🟢 Always Online
+          </div>
+
+          <div class="label-sub">
+            Bot ALWAYS online widihata pennanawa
+          </div>
+        </div>
+
+        <label class="switch">
+
+          <input
+            type="checkbox"
+            id="alwaysOnline"
+          >
+
+          <span class="slider"></span>
+
+        </label>
+
+      </div>
+
+      <div class="toggle-row">
+
+        <div>
+          <div class="label-text">
+            👁️ Auto Seen
+          </div>
+
+          <div class="label-sub">
+            Messages auto seen karanawa
+          </div>
+        </div>
+
+        <label class="switch">
+
+          <input
+            type="checkbox"
+            id="alwaysMsgSeen"
+          >
+
+          <span class="slider"></span>
+
+        </label>
+
+      </div>
+
+      <div class="toggle-row">
+
+        <div>
+          <div class="label-text">
+            📺 Auto Status View
+          </div>
+
+          <div class="label-sub">
+            Status updates auto balanawa
+          </div>
+        </div>
+
+        <label class="switch">
+
+          <input
+            type="checkbox"
+            id="statusView"
+          >
+
+          <span class="slider"></span>
+
+        </label>
+
+      </div>
+
+      <div class="toggle-row">
+
+        <div>
+          <div class="label-text">
+            ❤️ Auto Status Like
+          </div>
+
+          <div class="label-sub">
+            Status updates auto react karanawa
+          </div>
+        </div>
+
+        <label class="switch">
+
+          <input
+            type="checkbox"
+            id="autoLike"
+          >
+
+          <span class="slider"></span>
+
+        </label>
+
+      </div>
+
+      <div class="toggle-row">
+
+        <div>
+          <div class="label-text">
+            🗑️ Anti-Delete
+          </div>
+
+          <div class="label-sub">
+            Delete karapu messages handle karanawa
+          </div>
+        </div>
+
+        <label class="switch">
+
+          <input
+            type="checkbox"
+            id="antiDelete"
+          >
+
+          <span class="slider"></span>
+
+        </label>
+
+      </div>
+
+      <button id="saveBtn">
+        💾 Save Changes
+      </button>
+
+      <div
+        class="msg"
+        id="saveMsg"
+      ></div>
+
+    </div>
+
+    <!-- AUTO REPLY -->
+
+    <div class="card">
+
+      <div class="card-title">
+        💬 Auto Reply Manager
+      </div>
+
+      <div class="card-sub">
+        Keyword ekakata text/image reply ekak set karanna.
+      </div>
+
+      <label>
+        Keyword
+      </label>
+
+      <input
+        id="arKeyword"
+        placeholder="e.g. hi"
+        autocomplete="off"
+      >
+
+      <label>
+        Reply Text
+      </label>
+
+      <input
+        id="arReply"
+        placeholder="e.g. Hello! Welcome 👋"
+        autocomplete="off"
+      >
+
+      <label>
+        Image URL
+      </label>
+
+      <input
+        id="arImage"
+        placeholder="https://example.com/image.jpg"
+        autocomplete="off"
+      >
+
+      <button id="arAddBtn">
+        ➕ Add / Update Reply
+      </button>
+
+      <div
+        class="msg"
+        id="arMsg"
+      ></div>
+
+      <div
+        id="arList"
+        style="margin-top:18px;"
+      ></div>
+
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+
+/* =========================================================
+   INTRO
+========================================================= */
+
+window.addEventListener(
+  'load',
+  function() {
+
+    setTimeout(
+      function() {
+
+        document
+          .getElementById(
+            'introLoader'
+          )
+          .classList
+          .add('hide');
+
+      },
+      900
+    );
+
+  }
+);
+
+/* =========================================================
+   ELEMENTS
+========================================================= */
+
+let currentKey = null;
+
+let selectedMode =
+  'PRIVATE';
+
+const loginCard =
+  document.getElementById(
+    'loginCard'
+  );
+
+const dashboard =
+  document.getElementById(
+    'dashboard'
+  );
+
+const loginMsg =
+  document.getElementById(
+    'loginMsg'
+  );
+
+const saveMsg =
+  document.getElementById(
+    'saveMsg'
+  );
+
+const keyInput =
+  document.getElementById(
+    'keyInput'
+  );
+
+const botName =
+  document.getElementById(
+    'botName'
+  );
+
+const botImage =
+  document.getElementById(
+    'botImage'
+  );
+
+const botFooter =
+  document.getElementById(
+    'botFooter'
+  );
+
+const movieCaption =
+  document.getElementById(
+    'movieCaption'
+  );
+
+const alwaysOnline =
+  document.getElementById(
+    'alwaysOnline'
+  );
+
+const alwaysMsgSeen =
+  document.getElementById(
+    'alwaysMsgSeen'
+  );
+
+const statusView =
+  document.getElementById(
+    'statusView'
+  );
+
+const autoLike =
+  document.getElementById(
+    'autoLike'
+  );
+
+const antiDelete =
+  document.getElementById(
+    'antiDelete'
+  );
+
+const publicMode =
+  document.getElementById(
+    'publicMode'
+  );
+
+const privateMode =
+  document.getElementById(
+    'privateMode'
+  );
+
+const modeStatus =
+  document.getElementById(
+    'modeStatus'
+  );
+
+/* =========================================================
+   MODE UI
+========================================================= */
+
+function selectMode(mode) {
+
+  selectedMode =
+    mode === 'PUBLIC'
+      ? 'PUBLIC'
+      : 'PRIVATE';
+
+  publicMode.classList.remove(
+    'active'
+  );
+
+  privateMode.classList.remove(
+    'active'
+  );
+
+  modeStatus.classList.remove(
+    'public',
+    'private'
+  );
+
+  if (
+    selectedMode ===
+    'PUBLIC'
+  ) {
+
+    publicMode.classList.add(
+      'active'
+    );
+
+    modeStatus.classList.add(
+      'public'
+    );
+
+    modeStatus.textContent =
+      '🌐 Public Mode selected';
+
+  } else {
+
+    privateMode.classList.add(
+      'active'
+    );
+
+    modeStatus.classList.add(
+      'private'
+    );
+
+    modeStatus.textContent =
+      '🔒 Private Mode selected';
+  }
+}
+
+publicMode.addEventListener(
+  'click',
+  function() {
+    selectMode('PUBLIC');
+  }
+);
+
+privateMode.addEventListener(
+  'click',
+  function() {
+    selectMode('PRIVATE');
+  }
+);
+
+/* =========================================================
+   LOGIN
+========================================================= */
+
+async function login() {
+
+  const key =
+    keyInput.value.trim();
+
+  if (!key) {
+
+    loginMsg.textContent =
+      '⚠ Access key eka enter karanna';
+
+    loginMsg.style.display =
+      'block';
+
+    return;
+  }
+
+  loginMsg.style.display =
+    'none';
+
+  const loginBtn =
+    document.getElementById(
+      'loginBtn'
+    );
+
+  loginBtn.disabled = true;
+
+  loginBtn.textContent =
+    '⏳ Checking...';
+
+  try {
+
+    const res =
+      await fetch(
+        '/api/bot-settings/' +
+        encodeURIComponent(key),
+        {
+          method: 'GET',
+          cache: 'no-store'
+        }
+      );
+
+    const data =
+      await res.json();
+
+    if (!res.ok) {
+      throw new Error(
+        data.error ||
+        'Login failed'
+      );
+    }
+
+    currentKey =
+      key;
+
+    document
+      .getElementById(
+        'botNum'
+      )
+      .textContent =
+        '📱 Bot: ' +
+        (
+          data.number ||
+          'N/A'
+        );
+
+    botName.value =
+      data.BOT_NAME || '';
+
+    botImage.value =
+      data.BOT_IMAGE || '';
+
+    botFooter.value =
+      data.BOT_FOOTER || '';
+
+    movieCaption.value =
+      data.MOVIE_CAPTION ||
+      data.MOVIE_FOOTER ||
+      '';
+
+    alwaysOnline.checked =
+      !!data.ALWAYS_ONLINE;
+
+    alwaysMsgSeen.checked =
+      !!data.ALWAYS_MSG_SEEN;
+
+    statusView.checked =
+      !!data.STATUS_VIEW;
+
+    autoLike.checked =
+      !!data.AUTO_LIKE;
+
+    antiDelete.checked =
+      !!data.ANTI_DELETE;
+
+    selectMode(
+      data.MODE || 'PRIVATE'
+    );
+
+    loginCard
+      .classList
+      .add('hidden');
+
+    dashboard
+      .classList
+      .remove('hidden');
+
+    loadAutoReplies();
+
+  } catch (err) {
+
+    loginMsg.textContent =
+      '⚠ ' +
+      err.message;
+
+    loginMsg.style.display =
+      'block';
+
+  } finally {
+
+    loginBtn.disabled =
+      false;
+
+    loginBtn.textContent =
+      '🔓 Login';
+  }
+}
+
+document
+  .getElementById(
+    'loginBtn'
+  )
+  .addEventListener(
+    'click',
+    login
+  );
+
+keyInput.addEventListener(
+  'keydown',
+  function(e) {
+
+    if (
+      e.key === 'Enter'
+    ) {
+      login();
     }
 
   }
 );
 
-
 /* =========================================================
-   CLEAN OLD METRICS
+   SAVE SETTINGS
 ========================================================= */
 
-async function cleanOldMetrics() {
+async function saveSettings() {
+
+  if (!currentKey) {
+    return;
+  }
+
+  saveMsg.style.display =
+    'none';
+
+  const saveBtn =
+    document.getElementById(
+      'saveBtn'
+    );
+
+  saveBtn.disabled =
+    true;
+
+  saveBtn.textContent =
+    '⏳ Saving...';
 
   try {
 
-    if (!metricsCollection) {
+    const res =
+      await fetch(
+        '/api/bot-settings/' +
+        encodeURIComponent(
+          currentKey
+        ),
+        {
+          method: 'POST',
+
+          headers: {
+            'Content-Type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+
+              BOT_NAME:
+                botName.value.trim(),
+
+              BOT_IMAGE:
+                botImage.value.trim(),
+
+              BOT_FOOTER:
+                botFooter.value.trim(),
+
+              MOVIE_CAPTION:
+                movieCaption.value.trim(),
+
+              MODE:
+                selectedMode,
+
+              ALWAYS_ONLINE:
+                alwaysOnline.checked,
+
+              ALWAYS_MSG_SEEN:
+                alwaysMsgSeen.checked,
+
+              STATUS_VIEW:
+                statusView.checked,
+
+              AUTO_LIKE:
+                autoLike.checked,
+
+              ANTI_DELETE:
+                antiDelete.checked
+
+            })
+        }
+      );
+
+    const data =
+      await res.json();
+
+    if (!res.ok) {
+      throw new Error(
+        data.error ||
+        'Save failed'
+      );
+    }
+
+    saveMsg.textContent =
+      '✅ Settings saved! Bot ekata ~5 seconds athulata auto-apply wenawa.';
+
+    saveMsg.className =
+      'msg ok';
+
+    saveMsg.style.display =
+      'block';
+
+  } catch (err) {
+
+    saveMsg.textContent =
+      '⚠ ' +
+      err.message;
+
+    saveMsg.className =
+      'msg err';
+
+    saveMsg.style.display =
+      'block';
+
+  } finally {
+
+    saveBtn.disabled =
+      false;
+
+    saveBtn.textContent =
+      '💾 Save Changes';
+  }
+}
+
+document
+  .getElementById(
+    'saveBtn'
+  )
+  .addEventListener(
+    'click',
+    saveSettings
+  );
+
+/* =========================================================
+   AUTO REPLY
+========================================================= */
+
+const arKeyword =
+  document.getElementById(
+    'arKeyword'
+  );
+
+const arReply =
+  document.getElementById(
+    'arReply'
+  );
+
+const arImage =
+  document.getElementById(
+    'arImage'
+  );
+
+const arMsg =
+  document.getElementById(
+    'arMsg'
+  );
+
+const arList =
+  document.getElementById(
+    'arList'
+  );
+
+function escapeHtml(str) {
+
+  const div =
+    document.createElement(
+      'div'
+    );
+
+  div.textContent =
+    str;
+
+  return div.innerHTML;
+}
+
+async function loadAutoReplies() {
+
+  if (!currentKey) {
+    return;
+  }
+
+  arList.innerHTML =
+    '<div style="color:#94a3b8;font-size:13px;">⏳ Loading...</div>';
+
+  try {
+
+    const res =
+      await fetch(
+        '/api/auto-replies/' +
+        encodeURIComponent(
+          currentKey
+        ),
+        {
+          cache: 'no-store'
+        }
+      );
+
+    const data =
+      await res.json();
+
+    if (!res.ok) {
+      throw new Error(
+        data.error ||
+        'Load failed'
+      );
+    }
+
+    const rules =
+      data.rules || [];
+
+    if (
+      rules.length === 0
+    ) {
+
+      arList.innerHTML =
+        '<div style="color:#94a3b8;font-size:13px;">Auto-reply rules nathi.</div>';
+
       return;
     }
 
-    const oldDate =
-      new Date(
-        Date.now() -
-        7 *
-        24 *
-        60 *
-        60 *
-        1000
-      );
+    arList.innerHTML =
+      rules
+        .map(
+          function(r) {
 
-    const result =
-      await metricsCollection.deleteMany({
-        createdAt: {
-          $lt: oldDate
+            const imgTag =
+              r.image
+
+                ? '<img src="' +
+                  escapeHtml(
+                    r.image
+                  ) +
+                  '" style="width:38px;height:38px;border-radius:9px;object-fit:cover;flex-shrink:0;" onerror="this.style.display=\\'none\\'">'
+
+                : '';
+
+            return (
+
+              '<div class="ar-item">' +
+
+              imgTag +
+
+              '<div style="flex:1;min-width:0;">' +
+
+              '<div style="font-size:13px;font-weight:800;color:#34d399;">' +
+
+              escapeHtml(
+                r.keyword
+              ) +
+
+              '</div>' +
+
+              '<div style="font-size:12px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' +
+
+              escapeHtml(
+                r.reply ||
+                '(image only)'
+              ) +
+
+              '</div>' +
+
+              '</div>' +
+
+              '<button data-keyword="' +
+
+              escapeHtml(
+                r.keyword
+              ) +
+
+              '" class="ar-delete">🗑️</button>' +
+
+              '</div>'
+            );
+          }
+        )
+        .join('');
+
+    arList
+      .querySelectorAll(
+        '.ar-delete'
+      )
+      .forEach(
+        function(btn) {
+
+          btn.addEventListener(
+            'click',
+            function() {
+
+              deleteAutoReply(
+                btn.getAttribute(
+                  'data-keyword'
+                )
+              );
+
+            }
+          );
+
         }
-      });
-
-    if (
-      result.deletedCount > 0
-    ) {
-
-      console.log(
-        `🧹 Removed ${result.deletedCount} old metric records`
       );
 
-    }
+  } catch (err) {
 
-  } catch (error) {
-
-    console.error(
-      '⚠️ Metrics cleanup:',
-      error.message
-    );
-
+    arList.innerHTML =
+      '<div style="color:#f87171;font-size:13px;">⚠ ' +
+      escapeHtml(
+        err.message
+      ) +
+      '</div>';
   }
-
 }
 
+async function addAutoReply() {
+
+  if (!currentKey) {
+    return;
+  }
+
+  const keyword =
+    arKeyword.value.trim();
+
+  const reply =
+    arReply.value.trim();
+
+  const image =
+    arImage.value.trim();
+
+  arMsg.style.display =
+    'none';
+
+  if (!keyword) {
+
+    arMsg.textContent =
+      '⚠ Keyword eka danna';
+
+    arMsg.className =
+      'msg err';
+
+    arMsg.style.display =
+      'block';
+
+    return;
+  }
+
+  if (!reply && !image) {
+
+    arMsg.textContent =
+      '⚠ Reply text ekak nathnam image ekak danna';
+
+    arMsg.className =
+      'msg err';
+
+    arMsg.style.display =
+      'block';
+
+    return;
+  }
+
+  const addBtn =
+    document.getElementById(
+      'arAddBtn'
+    );
+
+  addBtn.disabled =
+    true;
+
+  addBtn.textContent =
+    '⏳ Saving...';
+
+  try {
+
+    const res =
+      await fetch(
+        '/api/auto-replies/' +
+        encodeURIComponent(
+          currentKey
+        ),
+        {
+          method: 'POST',
+
+          headers: {
+            'Content-Type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+              keyword,
+              reply,
+              image
+            })
+        }
+      );
+
+    const data =
+      await res.json();
+
+    if (!res.ok) {
+      throw new Error(
+        data.error ||
+        'Save failed'
+      );
+    }
+
+    arMsg.textContent =
+      '✅ Auto-reply saved!';
+
+    arMsg.className =
+      'msg ok';
+
+    arMsg.style.display =
+      'block';
+
+    arKeyword.value =
+      '';
+
+    arReply.value =
+      '';
+
+    arImage.value =
+      '';
+
+    loadAutoReplies();
+
+  } catch (err) {
+
+    arMsg.textContent =
+      '⚠ ' +
+      err.message;
+
+    arMsg.className =
+      'msg err';
+
+    arMsg.style.display =
+      'block';
+
+  } finally {
+
+    addBtn.disabled =
+      false;
+
+    addBtn.textContent =
+      '➕ Add / Update Reply';
+  }
+}
+
+async function deleteAutoReply(
+  keyword
+) {
+
+  if (!currentKey) {
+    return;
+  }
+
+  try {
+
+    await fetch(
+      '/api/auto-replies/' +
+      encodeURIComponent(
+        currentKey
+      ) +
+      '/' +
+      encodeURIComponent(
+        keyword
+      ),
+      {
+        method: 'DELETE'
+      }
+    );
+
+    loadAutoReplies();
+
+  } catch (err) {
+
+    console.error(
+      'Delete failed:',
+      err
+    );
+  }
+}
+
+document
+  .getElementById(
+    'arAddBtn'
+  )
+  .addEventListener(
+    'click',
+    addAutoReply
+  );
+
+</script>
+
+</body>
+</html>`);
+
+  }
+);
 
 /* =========================================================
-   GLOBAL CSS
+   HOME / ANALYTICS DASHBOARD
 ========================================================= */
 
-const CSS = `
+app.get(
+  '/',
+  (req, res) => {
+
+    res.set(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, proxy-revalidate'
+    );
+
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+  Shaggy Bot Analytics
+</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+
+<style>
 
 * {
   box-sizing: border-box;
@@ -962,207 +3369,87 @@ const CSS = `
 
 :root {
 
-  --bg: #02040a;
+  --green:
+    #25d366;
 
-  --card:
-    rgba(10,15,27,.72);
-
-  --line:
-    rgba(255,255,255,.08);
-
-  --text:
-    #f5f8ff;
-
-  --muted:
-    #8792a8;
-
-  --cyan:
-    #00eaff;
+  --green2:
+    #34d399;
 
   --blue:
-    #5865ff;
+    #60a5fa;
 
   --purple:
-    #a855f7;
-
-  --green:
-    #21f39a;
+    #a78bfa;
 
   --red:
-    #ff5577;
+    #f87171;
 
-  --orange:
-    #ffad42;
+  --yellow:
+    #fbbf24;
 
-}
+  --bg:
+    #020617;
 
-html {
-  scroll-behavior: smooth;
+  --text:
+    #e2e8f0;
+
+  --muted:
+    #94a3b8;
+
+  --border:
+    rgba(255,255,255,.08);
+
 }
 
 body {
 
-  min-height: 100vh;
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
 
   color:
     var(--text);
 
-  font-family:
-    Inter,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  min-height:
+    100vh;
+
+  padding:
+    24px 15px;
 
   background:
 
     radial-gradient(
-      circle at 8% 5%,
-      rgba(0,234,255,.14),
+      circle at 5% 0%,
+      rgba(37,211,102,.11),
       transparent 28%
     ),
 
     radial-gradient(
-      circle at 92% 8%,
-      rgba(168,85,247,.15),
+      circle at 95% 10%,
+      rgba(96,165,250,.12),
       transparent 30%
     ),
 
     radial-gradient(
       circle at 50% 100%,
-      rgba(88,101,255,.13),
-      transparent 36%
+      rgba(167,139,250,.09),
+      transparent 35%
     ),
 
-    var(--bg);
+    #020617;
 
   overflow-x:
     hidden;
-
 }
-
-body::before {
-
-  content:
-    "";
-
-  position:
-    fixed;
-
-  inset:
-    0;
-
-  pointer-events:
-    none;
-
-  opacity:
-    .32;
-
-  background-image:
-
-    linear-gradient(
-      rgba(255,255,255,.025) 1px,
-      transparent 1px
-    ),
-
-    linear-gradient(
-      90deg,
-      rgba(255,255,255,.025) 1px,
-      transparent 1px
-    );
-
-  background-size:
-    55px 55px;
-
-  animation:
-    gridMove 18s linear infinite;
-
-}
-
-body::after {
-
-  content:
-    "";
-
-  position:
-    fixed;
-
-  width:
-    520px;
-
-  height:
-    520px;
-
-  left:
-    -280px;
-
-  bottom:
-    -280px;
-
-  border-radius:
-    50%;
-
-  background:
-    rgba(0,234,255,.08);
-
-  filter:
-    blur(95px);
-
-  pointer-events:
-    none;
-
-  animation:
-    orb 9s ease-in-out infinite;
-
-}
-
-a {
-  color: inherit;
-  text-decoration: none;
-}
-
-button,
-input,
-select,
-textarea {
-  font: inherit;
-}
-
-button {
-  cursor: pointer;
-}
-
-.wrap {
-
-  width:
-    min(
-      1200px,
-      calc(100% - 30px)
-    );
-
-  margin:
-    auto;
-
-  padding:
-    22px
-    0
-    70px;
-
-  position:
-    relative;
-
-  z-index:
-    2;
-
-}
-
 
 /* =========================================================
-   LOADING
+   INTRO
 ========================================================= */
 
-.loader {
+#intro {
 
   position:
     fixed;
@@ -1171,178 +3458,7 @@ button {
     0;
 
   z-index:
-    9999;
-
-  display:
-    grid;
-
-  place-items:
-    center;
-
-  background:
-    #02040a;
-
-  transition:
-    opacity .6s ease,
-    visibility .6s ease;
-
-}
-
-.loader.hide {
-
-  opacity:
-    0;
-
-  visibility:
-    hidden;
-
-  pointer-events:
-    none;
-
-}
-
-.loader-box {
-  text-align:
-    center;
-}
-
-.loader-logo {
-
-  width:
-    78px;
-
-  height:
-    78px;
-
-  display:
-    grid;
-
-  place-items:
-    center;
-
-  margin:
-    auto;
-
-  border-radius:
-    24px;
-
-  font-size:
-    35px;
-
-  background:
-
-    linear-gradient(
-      135deg,
-      rgba(0,234,255,.15),
-      rgba(168,85,247,.15)
-    );
-
-  border:
-    1px solid
-    rgba(0,234,255,.25);
-
-  box-shadow:
-
-    0 0 60px
-    rgba(0,234,255,.15);
-
-  animation:
-    loaderPulse 1.5s ease-in-out infinite;
-
-}
-
-.loader-title {
-
-  margin-top:
-    20px;
-
-  font-weight:
-    850;
-
-  letter-spacing:
-    .15em;
-
-  font-size:
-    16px;
-
-}
-
-.loader-text {
-
-  margin-top:
-    8px;
-
-  color:
-    #68758b;
-
-  font-size:
-    10px;
-
-  letter-spacing:
-    .12em;
-
-  text-transform:
-    uppercase;
-
-}
-
-.loader-bar {
-
-  width:
-    180px;
-
-  height:
-    3px;
-
-  margin:
-    18px auto 0;
-
-  overflow:
-    hidden;
-
-  border-radius:
-    999px;
-
-  background:
-    rgba(255,255,255,.06);
-
-}
-
-.loader-bar::after {
-
-  content:
-    "";
-
-  display:
-    block;
-
-  width:
-    55%;
-
-  height:
-    100%;
-
-  border-radius:
-    inherit;
-
-  background:
-    linear-gradient(
-      90deg,
-      var(--cyan),
-      var(--purple)
-    );
-
-  animation:
-    loaderBar 1.1s ease-in-out infinite;
-
-}
-
-
-/* =========================================================
-   TOPBAR
-========================================================= */
-
-.topbar {
+    99999;
 
   display:
     flex;
@@ -1351,17 +3467,44 @@ button {
     center;
 
   justify-content:
-    space-between;
+    center;
 
-  gap:
-    15px;
+  background:
+    #020617;
 
-  margin-bottom:
-    26px;
-
+  transition:
+    opacity .8s ease,
+    visibility .8s ease;
 }
 
-.brand {
+#intro.hide {
+
+  opacity:
+    0;
+
+  visibility:
+    hidden;
+}
+
+.introBox {
+
+  text-align:
+    center;
+
+  animation:
+    introFloat 2s infinite;
+}
+
+.introLogo {
+
+  width:
+    82px;
+
+  height:
+    82px;
+
+  border-radius:
+    25px;
 
   display:
     flex;
@@ -1369,371 +3512,171 @@ button {
   align-items:
     center;
 
-  gap:
-    12px;
-
-}
-
-.brand-icon {
-
-  width:
-    48px;
-
-  height:
-    48px;
-
-  display:
-    grid;
-
-  place-items:
+  justify-content:
     center;
 
-  border-radius:
-    16px;
+  margin:
+    auto;
+
+  font-size:
+    40px;
 
   background:
-
     linear-gradient(
       135deg,
-      rgba(0,234,255,.17),
-      rgba(168,85,247,.17)
+      #25d366,
+      #60a5fa,
+      #a78bfa
     );
 
-  border:
-    1px solid
-    rgba(0,234,255,.25);
-
   box-shadow:
-    0 0 35px
-    rgba(0,234,255,.12);
-
-  font-size:
-    22px;
-
+    0 0 70px
+    rgba(37,211,102,.22);
 }
 
-.brand strong {
-
-  display:
-    block;
-
-  font-size:
-    15px;
-
-  letter-spacing:
-    .12em;
-
-}
-
-.brand span {
-
-  display:
-    block;
-
-  color:
-    var(--muted);
-
-  font-size:
-    9px;
+.introTitle {
 
   margin-top:
-    3px;
+    17px;
+
+  font-weight:
+    900;
 
   letter-spacing:
-    .14em;
-
-  text-transform:
-    uppercase;
-
+    1px;
 }
 
-.nav {
-
-  display:
-    flex;
-
-  flex-wrap:
-    wrap;
-
-  gap:
-    8px;
-
-}
-
-.nav a {
-
-  padding:
-    10px 14px;
-
-  border:
-    1px solid
-    var(--line);
-
-  border-radius:
-    12px;
-
-  background:
-    rgba(255,255,255,.035);
+.introSub {
 
   color:
-    #dce4f3;
+    #64748b;
 
   font-size:
     11px;
 
-  transition:
-    .25s;
-
+  margin-top:
+    5px;
 }
 
-.nav a:hover {
+.introLoader {
 
-  transform:
-    translateY(-2px);
+  width:
+    180px;
 
-  border-color:
-    rgba(0,234,255,.35);
+  height:
+    4px;
 
-  background:
-    rgba(0,234,255,.07);
-
-  box-shadow:
-    0 10px 30px
-    rgba(0,234,255,.08);
-
-}
-
-
-/* =========================================================
-   MODE BADGE
-========================================================= */
-
-.mode-badge {
-
-  display:
-    inline-flex;
-
-  align-items:
-    center;
-
-  gap:
-    7px;
-
-  padding:
-    7px 11px;
+  margin:
+    15px auto 0;
 
   border-radius:
-    999px;
-
-  font-size:
-    9px;
-
-  font-weight:
-    850;
-
-  letter-spacing:
-    .1em;
-
-  text-transform:
-    uppercase;
-
-}
-
-.mode-public {
-
-  color:
-    #70f7ff;
+    10px;
 
   background:
-    rgba(0,234,255,.06);
-
-  border:
-    1px solid
-    rgba(0,234,255,.18);
-
-}
-
-.mode-private {
-
-  color:
-    #ffc77a;
-
-  background:
-    rgba(255,173,66,.07);
-
-  border:
-    1px solid
-    rgba(255,173,66,.2);
-
-}
-
-
-/* =========================================================
-   HERO
-========================================================= */
-
-.hero {
-
-  position:
-    relative;
+    rgba(255,255,255,.07);
 
   overflow:
     hidden;
-
-  padding:
-    75px 42px;
-
-  border:
-    1px solid
-    var(--line);
-
-  border-radius:
-    30px;
-
-  background:
-    rgba(7,10,18,.72);
-
-  box-shadow:
-    0 30px 90px
-    rgba(0,0,0,.45);
-
-  backdrop-filter:
-    blur(25px);
-
 }
 
-.hero::before {
+.introLoader span {
 
-  content:
-    "";
-
-  position:
-    absolute;
+  display:
+    block;
 
   width:
-    480px;
+    45%;
 
   height:
-    480px;
-
-  right:
-    -200px;
-
-  top:
-    -220px;
-
-  border-radius:
-    50%;
+    100%;
 
   background:
-    radial-gradient(
-      circle,
-      rgba(0,234,255,.22),
-      transparent 68%
+    linear-gradient(
+      90deg,
+      #25d366,
+      #60a5fa,
+      #a78bfa
     );
 
   animation:
-    heroOrb 8s ease-in-out infinite;
-
+    loaderMove 1.2s infinite;
 }
 
-.eyebrow {
+@keyframes loaderMove {
+
+  0% {
+    transform:
+      translateX(-120%);
+  }
+
+  100% {
+    transform:
+      translateX(430%);
+  }
+}
+
+@keyframes introFloat {
+
+  0%,100% {
+    transform:
+      translateY(0);
+  }
+
+  50% {
+    transform:
+      translateY(-7px);
+  }
+}
+
+/* =========================================================
+   WRAPPER
+========================================================= */
+
+.wrap {
+
+  max-width:
+    1200px;
+
+  margin:
+    0 auto;
+}
+
+/* =========================================================
+   HEADER
+========================================================= */
+
+.header {
 
   display:
-    inline-flex;
+    flex;
+
+  justify-content:
+    space-between;
 
   align-items:
     center;
 
   gap:
-    8px;
-
-  padding:
-    7px 11px;
-
-  border-radius:
-    999px;
-
-  color:
-    #8cf8ff;
-
-  background:
-    rgba(0,234,255,.05);
-
-  border:
-    1px solid
-    rgba(0,234,255,.17);
-
-  font-size:
-    9px;
-
-  font-weight:
-    800;
-
-  letter-spacing:
-    .13em;
-
-  text-transform:
-    uppercase;
-
-}
-
-.dot {
-
-  width:
-    7px;
-
-  height:
-    7px;
-
-  flex-shrink:
-    0;
-
-  border-radius:
-    50%;
-
-  background:
-    var(--green);
-
-  box-shadow:
-    0 0 15px
-    var(--green);
-
-  animation:
-    pulse 1.6s infinite;
-
-}
-
-.hero h1 {
-
-  position:
-    relative;
-
-  max-width:
-    850px;
-
-  margin-top:
     20px;
 
+  margin-bottom:
+    20px;
+}
+
+.title {
+
   font-size:
-    clamp(
-      43px,
-      7vw,
-      80px
-    );
+    26px;
 
-  line-height:
-    .98;
-
-  letter-spacing:
-    -.055em;
+  font-weight:
+    900;
 
   background:
     linear-gradient(
-      100deg,
-      #fff,
-      #80f8ff 45%,
-      #a677ff
+      90deg,
+      #25d366,
+      #60a5fa,
+      #a78bfa
     );
 
   -webkit-background-clip:
@@ -1744,421 +3687,72 @@ button {
 
   color:
     transparent;
-
 }
 
-.hero p {
-
-  max-width:
-    700px;
-
-  margin-top:
-    22px;
+.subtitle {
 
   color:
-    #99a5ba;
-
-  line-height:
-    1.8;
+    var(--muted);
 
   font-size:
-    14px;
+    12px;
 
+  margin-top:
+    5px;
 }
 
-.actions {
+.nav {
 
   display:
     flex;
-
-  flex-wrap:
-    wrap;
-
-  gap:
-    10px;
-
-  margin-top:
-    30px;
-
-}
-
-.btn {
-
-  min-height:
-    47px;
-
-  display:
-    inline-flex;
-
-  align-items:
-    center;
-
-  justify-content:
-    center;
 
   gap:
     8px;
 
-  padding:
-    0 18px;
+  flex-wrap:
+    wrap;
+}
 
-  border-radius:
-    13px;
+.nav a {
 
   color:
-    white;
+    #cbd5e1;
+
+  text-decoration:
+    none;
+
+  font-size:
+    12px;
+
+  padding:
+    9px 12px;
 
   border:
     1px solid
-    rgba(255,255,255,.1);
+    var(--border);
+
+  border-radius:
+    10px;
 
   background:
     rgba(255,255,255,.04);
 
-  font-size:
-    11px;
-
-  font-weight:
-    750;
-
   transition:
-    .25s;
-
+    .2s;
 }
 
-.btn:hover {
+.nav a:hover {
+
+  background:
+    rgba(255,255,255,.08);
 
   transform:
-    translateY(-3px);
-
-  box-shadow:
-    0 15px 40px
-    rgba(0,0,0,.3);
-
+    translateY(-1px);
 }
-
-.btn-primary {
-
-  background:
-    linear-gradient(
-      135deg,
-      #00bcd4,
-      #5865ff
-    );
-
-  border-color:
-    rgba(0,234,255,.3);
-
-  box-shadow:
-    0 12px 35px
-    rgba(0,190,255,.17);
-
-}
-
-.btn-private {
-
-  background:
-    linear-gradient(
-      135deg,
-      #b76e00,
-      #a855f7
-    );
-
-}
-
-.btn-danger {
-
-  background:
-    rgba(255,85,119,.08);
-
-  color:
-    #ff8ca4;
-
-  border-color:
-    rgba(255,85,119,.18);
-
-}
-
 
 /* =========================================================
-   SECTION
+   LIVE STATUS
 ========================================================= */
-
-.section {
-  margin-top: 30px;
-}
-
-.section-title {
-  margin-bottom: 14px;
-}
-
-.section-title small {
-
-  color:
-    #72f6ff;
-
-  font-size:
-    9px;
-
-  font-weight:
-    800;
-
-  letter-spacing:
-    .17em;
-
-  text-transform:
-    uppercase;
-
-}
-
-.section-title h2 {
-
-  margin-top:
-    6px;
-
-  font-size:
-    24px;
-
-  letter-spacing:
-    -.03em;
-
-}
-
-.section-title p {
-
-  color:
-    var(--muted);
-
-  margin-top:
-    7px;
-
-  font-size:
-    11px;
-
-}
-
-
-/* =========================================================
-   CARDS
-========================================================= */
-
-.card {
-
-  border:
-    1px solid
-    var(--line);
-
-  border-radius:
-    21px;
-
-  background:
-    var(--card);
-
-  box-shadow:
-    0 20px 60px
-    rgba(0,0,0,.25);
-
-  backdrop-filter:
-    blur(22px);
-
-}
-
-
-/* =========================================================
-   STATS
-========================================================= */
-
-.stats {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    repeat(4, 1fr);
-
-  gap:
-    13px;
-
-}
-
-.stat {
-
-  padding:
-    21px;
-
-  transition:
-    .3s;
-
-}
-
-.stat:hover {
-
-  transform:
-    translateY(-4px);
-
-  border-color:
-    rgba(0,234,255,.17);
-
-}
-
-.stat-top {
-
-  display:
-    flex;
-
-  justify-content:
-    space-between;
-
-  align-items:
-    center;
-
-}
-
-.stat-icon {
-
-  width:
-    40px;
-
-  height:
-    40px;
-
-  display:
-    grid;
-
-  place-items:
-    center;
-
-  border-radius:
-    12px;
-
-  background:
-    rgba(0,234,255,.07);
-
-  border:
-    1px solid
-    rgba(0,234,255,.13);
-
-}
-
-.label {
-
-  color:
-    var(--muted);
-
-  font-size:
-    10px;
-
-}
-
-.value {
-
-  margin-top:
-    15px;
-
-  font-size:
-    36px;
-
-  font-weight:
-    850;
-
-  letter-spacing:
-    -.04em;
-
-}
-
-.note {
-
-  margin-top:
-    7px;
-
-  color:
-    #647188;
-
-  font-size:
-    9px;
-
-}
-
-
-/* =========================================================
-   ANALYTICS
-========================================================= */
-
-.analytics-grid {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    1.7fr .8fr;
-
-  gap:
-    14px;
-
-}
-
-.panel {
-
-  padding:
-    21px;
-
-}
-
-.panel-head {
-
-  display:
-    flex;
-
-  justify-content:
-    space-between;
-
-  align-items:
-    center;
-
-  gap:
-    15px;
-
-  margin-bottom:
-    18px;
-
-}
-
-.panel-title {
-
-  font-size:
-    14px;
-
-  font-weight:
-    800;
-
-}
-
-.panel-sub {
-
-  color:
-    var(--muted);
-
-  font-size:
-    9px;
-
-  margin-top:
-    4px;
-
-}
-
-.chart {
-
-  height:
-    320px;
-
-}
-
-.chart-small {
-
-  height:
-    230px;
-
-}
 
 .live {
 
@@ -2171,1032 +3765,329 @@ button {
   gap:
     7px;
 
-  padding:
-    7px 11px;
-
-  border-radius:
-    999px;
-
   color:
-    #9fffd9;
-
-  background:
-    rgba(33,243,154,.05);
-
-  border:
-    1px solid
-    rgba(33,243,154,.16);
-
-  font-size:
-    9px;
-
-}
-
-
-/* =========================================================
-   FEATURES
-========================================================= */
-
-.features {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    repeat(3, 1fr);
-
-  gap:
-    13px;
-
-}
-
-.feature {
-
-  padding:
-    21px;
-
-  transition:
-    .3s;
-
-}
-
-.feature:hover {
-
-  transform:
-    translateY(-4px);
-
-  border-color:
-    rgba(0,234,255,.17);
-
-}
-
-.feature-icon {
-
-  width:
-    42px;
-
-  height:
-    42px;
-
-  display:
-    grid;
-
-  place-items:
-    center;
-
-  border-radius:
-    13px;
-
-  background:
-    linear-gradient(
-      135deg,
-      rgba(0,234,255,.1),
-      rgba(168,85,247,.1)
-    );
-
-  margin-bottom:
-    15px;
-
-}
-
-.feature h3 {
-
-  font-size:
-    13px;
-
-}
-
-.feature p {
-
-  color:
-    var(--muted);
-
-  margin-top:
-    8px;
-
-  font-size:
-    10px;
-
-  line-height:
-    1.7;
-
-}
-
-
-/* =========================================================
-   SYSTEM LIST
-========================================================= */
-
-.system-list {
-
-  display:
-    grid;
-
-  gap:
-    8px;
-
-}
-
-.system-row {
-
-  display:
-    flex;
-
-  justify-content:
-    space-between;
-
-  gap:
-    10px;
-
-  padding:
-    12px;
-
-  border-radius:
-    12px;
-
-  background:
-    rgba(255,255,255,.025);
-
-  border:
-    1px solid
-    rgba(255,255,255,.05);
-
-  font-size:
-    9px;
-
-}
-
-.system-row span:first-child {
-  color:
-    #77849a;
-}
-
-.system-row span:last-child {
-
-  color:
-    #dce5f5;
-
-  font-weight:
-    750;
-
-}
-
-
-/* =========================================================
-   LOGIN
-========================================================= */
-
-.login {
-
-  min-height:
-    75vh;
-
-  display:
-    grid;
-
-  place-items:
-    center;
-
-}
-
-.login-box {
-
-  width:
-    min(
-      500px,
-      100%
-    );
-
-  padding:
-    30px;
-
-}
-
-.login-icon {
-
-  width:
-    62px;
-
-  height:
-    62px;
-
-  display:
-    grid;
-
-  place-items:
-    center;
-
-  border-radius:
-    19px;
-
-  background:
-    linear-gradient(
-      135deg,
-      rgba(0,234,255,.14),
-      rgba(168,85,247,.14)
-    );
-
-  font-size:
-    27px;
-
-  margin-bottom:
-    18px;
-
-}
-
-.login-box h1 {
-
-  font-size:
-    27px;
-
-}
-
-.login-box p {
-
-  color:
-    var(--muted);
+    #34d399;
 
   font-size:
     11px;
 
-  line-height:
-    1.7;
-
   margin-top:
-    7px;
-
+    8px;
 }
 
-.field {
-  margin-top:
-    17px;
-}
-
-label {
-
-  display:
-    block;
-
-  color:
-    #aeb9cc;
-
-  font-size:
-    9px;
-
-  font-weight:
-    750;
-
-  text-transform:
-    uppercase;
-
-  margin-bottom:
-    7px;
-
-}
-
-input,
-select,
-textarea {
+.liveDot {
 
   width:
-    100%;
-
-  outline:
-    none;
-
-  border:
-    1px solid
-    rgba(255,255,255,.09);
-
-  border-radius:
-    12px;
-
-  background:
-    rgba(0,0,0,.25);
-
-  color:
-    white;
-
-  padding:
-    12px 13px;
-
-  transition:
-    .25s;
-
-}
-
-input,
-select {
-  height:
-    47px;
-}
-
-textarea {
-
-  min-height:
-    95px;
-
-  resize:
-    vertical;
-
-  line-height:
-    1.6;
-
-}
-
-select option {
-
-  background:
-    #101521;
-
-  color:
-    white;
-
-}
-
-input:focus,
-select:focus,
-textarea:focus {
-
-  border-color:
-    rgba(0,234,255,.45);
-
-  box-shadow:
-    0 0 0 4px
-    rgba(0,234,255,.05);
-
-}
-
-.full {
-
-  width:
-    100%;
-
-  margin-top:
-    15px;
-
-}
-
-.msg {
-
-  min-height:
-    20px;
-
-  margin-top:
-    11px;
-
-  font-size:
-    10px;
-
-}
-
-.error {
-  color:
-    #ff7893;
-}
-
-.success {
-  color:
-    #5df2b0;
-}
-
-
-/* =========================================================
-   MANAGE
-========================================================= */
-
-.manage {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    1.5fr .8fr;
-
-  gap:
-    16px;
-
-}
-
-.settings {
-
-  padding:
-    23px;
-
-}
-
-.settings-head {
-
-  display:
-    flex;
-
-  justify-content:
-    space-between;
-
-  gap:
-    15px;
-
-  padding-bottom:
-    18px;
-
-  border-bottom:
-    1px solid
-    var(--line);
-
-}
-
-.settings-head h1 {
-
-  font-size:
-    22px;
-
-}
-
-.settings-head p {
-
-  color:
-    var(--muted);
-
-  margin-top:
-    5px;
-
-  font-size:
-    10px;
-
-}
-
-.bot-number {
-
-  height:
-    fit-content;
-
-  padding:
-    8px 11px;
-
-  border-radius:
-    999px;
-
-  color:
-    #80f8ff;
-
-  background:
-    rgba(0,234,255,.05);
-
-  border:
-    1px solid
-    rgba(0,234,255,.16);
-
-  font-size:
-    9px;
-
-}
-
-.form-grid {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  gap:
-    12px;
-
-}
-
-.wide {
-  grid-column:
-    1 / -1;
-}
-
-.group {
-  margin-top:
-    22px;
-}
-
-.group-title {
-
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  gap:
     8px;
 
-  margin-bottom:
-    12px;
-
-  font-size:
-    13px;
-
-  font-weight:
-    800;
-
-}
-
-.group-title span {
-
-  width:
-    29px;
-
   height:
-    29px;
-
-  display:
-    grid;
-
-  place-items:
-    center;
-
-  border-radius:
-    9px;
-
-  background:
-    rgba(0,234,255,.07);
-
-}
-
-.mode-selector {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  gap:
-    10px;
-
-}
-
-.mode-option {
-
-  position:
-    relative;
-
-}
-
-.mode-option input {
-
-  position:
-    absolute;
-
-  opacity:
-    0;
-
-  pointer-events:
-    none;
-
-}
-
-.mode-card {
-
-  display:
-    block;
-
-  padding:
-    17px;
-
-  border:
-    1px solid
-    rgba(255,255,255,.07);
-
-  border-radius:
-    16px;
-
-  background:
-    rgba(255,255,255,.025);
-
-  transition:
-    .25s;
-
-}
-
-.mode-card:hover {
-
-  transform:
-    translateY(-2px);
-
-}
-
-.mode-option input:checked +
-.mode-card.public {
-
-  border-color:
-    rgba(0,234,255,.45);
-
-  background:
-    rgba(0,234,255,.07);
-
-  box-shadow:
-    0 0 30px
-    rgba(0,234,255,.06);
-
-}
-
-.mode-option input:checked +
-.mode-card.private {
-
-  border-color:
-    rgba(255,173,66,.45);
-
-  background:
-    rgba(255,173,66,.07);
-
-  box-shadow:
-    0 0 30px
-    rgba(255,173,66,.06);
-
-}
-
-.mode-card strong {
-
-  display:
-    block;
-
-  font-size:
-    12px;
-
-}
-
-.mode-card small {
-
-  display:
-    block;
-
-  color:
-    #66738a;
-
-  margin-top:
-    6px;
-
-  font-size:
-    9px;
-
-  line-height:
-    1.5;
-
-}
-
-.toggles {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  gap:
-    9px;
-
-}
-
-.toggle {
-
-  display:
-    flex;
-
-  justify-content:
-    space-between;
-
-  align-items:
-    center;
-
-  gap:
-    10px;
-
-  padding:
-    13px;
-
-  border:
-    1px solid
-    rgba(255,255,255,.06);
-
-  border-radius:
-    14px;
-
-  background:
-    rgba(255,255,255,.025);
-
-}
-
-.toggle strong {
-
-  display:
-    block;
-
-  font-size:
-    10px;
-
-}
-
-.toggle small {
-
-  display:
-    block;
-
-  color:
-    #66738a;
-
-  margin-top:
-    4px;
-
-  font-size:
     8px;
-
-}
-
-.switch {
-
-  width:
-    44px;
-
-  height:
-    24px;
-
-  position:
-    relative;
-
-  flex-shrink:
-    0;
-
-}
-
-.switch input {
-  display:
-    none;
-}
-
-.slider {
-
-  position:
-    absolute;
-
-  inset:
-    0;
-
-  border-radius:
-    999px;
-
-  background:
-    #19202e;
-
-  border:
-    1px solid
-    rgba(255,255,255,.08);
-
-  transition:
-    .25s;
-
-}
-
-.slider::before {
-
-  content:
-    "";
-
-  position:
-    absolute;
-
-  width:
-    16px;
-
-  height:
-    16px;
-
-  left:
-    3px;
-
-  top:
-    3px;
 
   border-radius:
     50%;
 
   background:
-    #718097;
-
-  transition:
-    .25s;
-
-}
-
-.switch input:checked +
-.slider {
-
-  background:
-    rgba(0,234,255,.16);
-
-  border-color:
-    rgba(0,234,255,.4);
-
-}
-
-.switch input:checked +
-.slider::before {
-
-  transform:
-    translateX(20px);
-
-  background:
-    var(--cyan);
+    #34d399;
 
   box-shadow:
-    0 0 15px
-    var(--cyan);
+    0 0 12px
+    #34d399;
 
+  animation:
+    pulse 1.5s infinite;
 }
 
-.preview {
+@keyframes pulse {
 
-  padding:
-    23px;
+  0%,100% {
+    opacity: 1;
+  }
 
-  height:
-    fit-content;
-
-  position:
-    sticky;
-
-  top:
-    15px;
-
+  50% {
+    opacity: .3;
+  }
 }
 
-.preview-label {
+/* =========================================================
+   STATS
+========================================================= */
 
-  color:
-    #718097;
-
-  font-size:
-    8px;
-
-  font-weight:
-    800;
-
-  letter-spacing:
-    .15em;
-
-  text-transform:
-    uppercase;
-
-}
-
-.avatar {
-
-  width:
-    130px;
-
-  height:
-    130px;
-
-  margin:
-    20px auto;
+.stats {
 
   display:
     grid;
 
-  place-items:
-    center;
+  grid-template-columns:
+    repeat(4, minmax(0,1fr));
+
+  gap:
+    12px;
+
+  margin-bottom:
+    15px;
+}
+
+.stat {
+
+  position:
+    relative;
 
   overflow:
     hidden;
 
-  border-radius:
-    34px;
+  padding:
+    18px;
 
   border:
     1px solid
-    rgba(0,234,255,.2);
+    var(--border);
+
+  border-radius:
+    17px;
 
   background:
-    #0b101a;
+    linear-gradient(
+      145deg,
+      rgba(255,255,255,.065),
+      rgba(255,255,255,.025)
+    );
+
+  backdrop-filter:
+    blur(14px);
 
   box-shadow:
-    0 0 45px
-    rgba(0,234,255,.1);
+    0 20px 50px
+    rgba(0,0,0,.18);
 
-  font-size:
-    45px;
-
+  animation:
+    cardIn .6s ease;
 }
 
-.avatar img {
+.stat:after {
+
+  content:
+    '';
+
+  position:
+    absolute;
 
   width:
-    100%;
+    100px;
 
   height:
-    100%;
+    100px;
 
-  object-fit:
-    cover;
+  border-radius:
+    50%;
 
+  right:
+    -50px;
+
+  top:
+    -50px;
+
+  background:
+    rgba(255,255,255,.04);
 }
 
-.preview-name {
-
-  text-align:
-    center;
-
-  font-size:
-    18px;
-
-  font-weight:
-    850;
-
-}
-
-.preview-footer {
+.statLabel {
 
   color:
     var(--muted);
 
-  text-align:
-    center;
-
   font-size:
-    9px;
+    11px;
 
-  line-height:
-    1.6;
-
-  margin-top:
-    7px;
-
+  margin-bottom:
+    8px;
 }
 
-.movie-preview {
+.statValue {
+
+  font-size:
+    29px;
+
+  font-weight:
+    900;
+}
+
+.green {
+  color:
+    var(--green2);
+}
+
+.blue {
+  color:
+    var(--blue);
+}
+
+.purple {
+  color:
+    var(--purple);
+}
+
+.yellow {
+  color:
+    var(--yellow);
+}
+
+.statSub {
+
+  color:
+    #64748b;
+
+  font-size:
+    10px;
 
   margin-top:
-    18px;
+    5px;
+}
+
+@keyframes cardIn {
+
+  from {
+    opacity: 0;
+    transform:
+      translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform:
+      translateY(0);
+  }
+}
+
+/* =========================================================
+   CHART GRID
+========================================================= */
+
+.chartGrid {
+
+  display:
+    grid;
+
+  grid-template-columns:
+    repeat(2, minmax(0,1fr));
+
+  gap:
+    15px;
+}
+
+.chartCard {
 
   padding:
-    15px;
+    17px;
+
+  min-height:
+    370px;
 
   border:
     1px solid
-    rgba(168,85,247,.14);
+    var(--border);
+
+  border-radius:
+    19px;
+
+  background:
+    rgba(255,255,255,.04);
+
+  backdrop-filter:
+    blur(15px);
+
+  box-shadow:
+    0 20px 60px
+    rgba(0,0,0,.20);
+}
+
+.chartTitle {
+
+  font-size:
+    14px;
+
+  font-weight:
+    800;
+
+  margin-bottom:
+    3px;
+}
+
+.chartSub {
+
+  color:
+    var(--muted);
+
+  font-size:
+    10px;
+
+  margin-bottom:
+    12px;
+}
+
+.chartCanvas {
+
+  height:
+    290px;
+
+  position:
+    relative;
+}
+
+/* =========================================================
+   ANALYTICS TABLE
+========================================================= */
+
+.analytics {
+
+  margin-top:
+    15px;
+
+  display:
+    grid;
+
+  grid-template-columns:
+    repeat(4, minmax(0,1fr));
+
+  gap:
+    10px;
+}
+
+.analyticsBox {
+
+  padding:
+    14px;
+
+  border:
+    1px solid
+    var(--border);
 
   border-radius:
     14px;
 
   background:
-    rgba(168,85,247,.04);
-
+    rgba(255,255,255,.035);
 }
 
-.movie-preview-title {
-
-  color:
-    #aeb8cb;
-
-  font-size:
-    8px;
-
-  letter-spacing:
-    .13em;
-
-  text-transform:
-    uppercase;
-
-}
-
-.movie-preview-text {
-
-  margin-top:
-    8px;
-
-  color:
-    #e8ecf5;
+.analyticsLabel {
 
   font-size:
     10px;
 
-  line-height:
-    1.6;
-
+  color:
+    var(--muted);
 }
 
-.save-row {
+.analyticsValue {
 
-  display:
-    flex;
+  font-size:
+    18px;
 
-  gap:
-    10px;
+  font-weight:
+    800;
 
   margin-top:
-    23px;
-
+    5px;
 }
-
-.save-row .btn {
-  flex: 1;
-}
-
 
 /* =========================================================
    FOOTER
@@ -3208,3403 +4099,1104 @@ textarea:focus {
     center;
 
   color:
-    #657188;
+    #475569;
 
   font-size:
-    9px;
+    10px;
 
   margin-top:
-    30px;
-
+    22px;
 }
 
-.footer a {
+.error {
+
+  display:
+    none;
+
+  margin-top:
+    12px;
+
   color:
-    #7ff8ff;
-}
+    #f87171;
 
+  font-size:
+    12px;
+}
 
 /* =========================================================
-   ANIMATIONS
+   RESPONSIVE
 ========================================================= */
 
-@keyframes gridMove {
-
-  from {
-    background-position:
-      0 0,
-      0 0;
-  }
-
-  to {
-    background-position:
-      0 55px,
-      55px 0;
-  }
-
-}
-
-@keyframes orb {
-
-  50% {
-
-    transform:
-      translate(
-        80px,
-        -50px
-      )
-      scale(1.1);
-
-  }
-
-}
-
-@keyframes heroOrb {
-
-  50% {
-
-    transform:
-      translate(
-        -35px,
-        35px
-      )
-      scale(1.12);
-
-  }
-
-}
-
-@keyframes pulse {
-
-  50% {
-
-    transform:
-      scale(1.5);
-
-    opacity:
-      .55;
-
-  }
-
-}
-
-@keyframes loaderPulse {
-
-  50% {
-
-    transform:
-      scale(1.08);
-
-    box-shadow:
-      0 0 80px
-      rgba(0,234,255,.25);
-
-  }
-
-}
-
-@keyframes loaderBar {
-
-  0% {
-    transform:
-      translateX(-150%);
-  }
-
-  100% {
-    transform:
-      translateX(300%);
-  }
-
-}
-
-
-/* =========================================================
-   MOBILE
-========================================================= */
-
-@media(max-width:950px) {
+@media(max-width:850px) {
 
   .stats {
 
     grid-template-columns:
-      repeat(2, 1fr);
-
+      repeat(2,1fr);
   }
 
-  .analytics-grid,
-  .manage {
+  .chartGrid {
 
     grid-template-columns:
       1fr;
-
   }
 
-  .preview {
-
-    position:
-      static;
-
-  }
-
-}
-
-@media(max-width:700px) {
-
-  .features {
+  .analytics {
 
     grid-template-columns:
-      1fr;
-
+      repeat(2,1fr);
   }
 
-  .hero {
-
-    padding:
-      55px 25px;
-
-  }
-
-}
-
-@media(max-width:620px) {
-
-  .wrap {
-
-    width:
-      calc(100% - 18px);
-
-    padding-top:
-      14px;
-
-  }
-
-  .topbar {
+  .header {
 
     flex-direction:
       column;
 
     align-items:
       flex-start;
-
   }
+}
 
-  .nav {
+@media(max-width:500px) {
 
-    width:
-      100%;
-
-  }
-
-  .nav a {
-
-    flex:
-      1;
-
-    text-align:
-      center;
-
-  }
-
-  .hero {
-
+  body {
     padding:
-      43px 20px;
+      17px 10px;
+  }
 
-    border-radius:
+  .title {
+    font-size:
       22px;
-
-  }
-
-  .hero h1 {
-
-    font-size:
-      45px;
-
-  }
-
-  .hero p {
-
-    font-size:
-      13px;
-
-  }
-
-  .actions .btn {
-
-    width:
-      100%;
-
   }
 
   .stats {
 
     grid-template-columns:
-      1fr;
+      1fr 1fr;
 
+    gap:
+      8px;
   }
 
-  .form-grid,
-  .toggles,
-  .mode-selector {
+  .stat {
+    padding:
+      14px;
+  }
+
+  .statValue {
+    font-size:
+      23px;
+  }
+
+  .analytics {
 
     grid-template-columns:
-      1fr;
-
+      1fr 1fr;
   }
 
-  .wide {
+  .chartCard {
 
-    grid-column:
-      auto;
-
-  }
-
-  .settings,
-  .preview,
-  .login-box,
-  .panel {
+    min-height:
+      330px;
 
     padding:
-      18px;
-
+      13px;
   }
 
-  .settings-head {
-
-    flex-direction:
-      column;
-
-    align-items:
-      flex-start;
-
-  }
-
-  .chart {
+  .chartCanvas {
 
     height:
-      260px;
-
+      250px;
   }
-
 }
 
-@media(prefers-reduced-motion:reduce) {
+</style>
 
-  *,
-  *::before,
-  *::after {
+</head>
 
-    animation:
-      none !important;
+<body>
 
-    transition:
-      none !important;
+<!-- INTRO -->
 
-  }
+<div id="intro">
 
-}
+  <div class="introBox">
 
-`;
+    <div class="introLogo">
+      🤖
+    </div>
 
+    <div class="introTitle">
+      SHAGGY BOT ANALYTICS
+    </div>
 
-/* =========================================================
-   PAGE LOADER
-========================================================= */
+    <div class="introSub">
+      Initializing live monitoring...
+    </div>
 
-function loaderHTML() {
+    <div class="introLoader">
+      <span></span>
+    </div>
 
-  return `
-
-<div
-class="loader"
-id="pageLoader"
->
-
-<div class="loader-box">
-
-<div class="loader-logo">
-🤖
-</div>
-
-<div class="loader-title">
-SHAGGY XMD
-</div>
-
-<div class="loader-text">
-Initializing control center...
-</div>
-
-<div class="loader-bar"></div>
+  </div>
 
 </div>
+
+<div class="wrap">
+
+  <div class="header">
+
+    <div>
+
+      <div class="title">
+        🤖 Shaggy Bot Analytics
+      </div>
+
+      <div class="subtitle">
+        Live bot monitoring & 24-hour performance analytics
+      </div>
+
+      <div class="live">
+        <span class="liveDot"></span>
+        LIVE MONITORING
+        <span id="lastUpdate"></span>
+      </div>
+
+    </div>
+
+    <div class="nav">
+
+      <a href="/manage">
+        ⚙ Manage
+      </a>
+
+      <a href="${PAIR_WEB_URL}" target="_blank">
+        🔗 Pair Web
+      </a>
+
+    </div>
+
+  </div>
+
+  <!-- STATS -->
+
+  <div class="stats">
+
+    <div class="stat">
+
+      <div class="statLabel">
+        ONLINE BOTS
+      </div>
+
+      <div
+        class="statValue green"
+        id="onlineVal"
+      >
+        --
+      </div>
+
+      <div class="statSub">
+        Currently active
+      </div>
+
+    </div>
+
+    <div class="stat">
+
+      <div class="statLabel">
+        TOTAL BOTS
+      </div>
+
+      <div
+        class="statValue blue"
+        id="totalVal"
+      >
+        --
+      </div>
+
+      <div class="statSub">
+        Registered bots
+      </div>
+
+    </div>
+
+    <div class="stat">
+
+      <div class="statLabel">
+        AVAILABILITY
+      </div>
+
+      <div
+        class="statValue purple"
+        id="percentageVal"
+      >
+        --%
+      </div>
+
+      <div class="statSub">
+        Online / Total
+      </div>
+
+    </div>
+
+    <div class="stat">
+
+      <div class="statLabel">
+        PEAK ONLINE
+      </div>
+
+      <div
+        class="statValue yellow"
+        id="peakVal"
+      >
+        --
+      </div>
+
+      <div class="statSub">
+        Last 24 hours
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- CHARTS -->
+
+  <div class="chartGrid">
+
+    <div class="chartCard">
+
+      <div class="chartTitle">
+        📈 Bot Count Trend
+      </div>
+
+      <div class="chartSub">
+        Online vs Total bots — last 24 hours
+      </div>
+
+      <div class="chartCanvas">
+        <canvas id="countChart"></canvas>
+      </div>
+
+    </div>
+
+    <div class="chartCard">
+
+      <div class="chartTitle">
+        ⚡ Availability Trend
+      </div>
+
+      <div class="chartSub">
+        Online availability percentage — last 24 hours
+      </div>
+
+      <div class="chartCanvas">
+        <canvas id="availabilityChart"></canvas>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- EXTRA ANALYTICS -->
+
+  <div class="analytics">
+
+    <div class="analyticsBox">
+
+      <div class="analyticsLabel">
+        AVG ONLINE
+      </div>
+
+      <div
+        class="analyticsValue green"
+        id="avgOnline"
+      >
+        --
+      </div>
+
+    </div>
+
+    <div class="analyticsBox">
+
+      <div class="analyticsLabel">
+        AVG TOTAL
+      </div>
+
+      <div
+        class="analyticsValue blue"
+        id="avgTotal"
+      >
+        --
+      </div>
+
+    </div>
+
+    <div class="analyticsBox">
+
+      <div class="analyticsLabel">
+        AVG AVAILABILITY
+      </div>
+
+      <div
+        class="analyticsValue purple"
+        id="avgAvailability"
+      >
+        --%
+      </div>
+
+    </div>
+
+    <div class="analyticsBox">
+
+      <div class="analyticsLabel">
+        MIN ONLINE
+      </div>
+
+      <div
+        class="analyticsValue yellow"
+        id="minOnline"
+      >
+        --
+      </div>
+
+    </div>
+
+  </div>
+
+  <div
+    class="error"
+    id="errorBox"
+  ></div>
+
+  <div class="footer">
+    Shaggy Bot Control Center • Live analytics
+  </div>
 
 </div>
 
 <script>
+
+/* =========================================================
+   INTRO
+========================================================= */
 
 window.addEventListener(
-'load',
-function() {
+  'load',
+  function() {
 
-setTimeout(
-function() {
+    setTimeout(
+      function() {
 
-const loader =
-document.getElementById(
-'pageLoader'
-);
+        document
+          .getElementById(
+            'intro'
+          )
+          .classList
+          .add('hide');
 
-if (loader) {
-
-loader.classList.add(
-'hide'
-);
-
-}
-
-},
-450
-);
-
-});
-
-</script>
-
-`;
-
-}
-
-
-/* =========================================================
-   HOME PAGE
-========================================================= */
-
-app.get(
-  '/',
-  async (req, res) => {
-
-    res.set(
-      'Cache-Control',
-      'no-store'
+      },
+      1000
     );
-
-    res.send(`
-
-<!DOCTYPE html>
-
-<html lang="en">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1.0"
->
-
-<meta
-name="theme-color"
-content="#02040a"
->
-
-<title>
-SHAGGY XMD • Control Center
-</title>
-
-<style>
-${CSS}
-</style>
-
-</head>
-
-<body>
-
-${loaderHTML()}
-
-<div class="wrap">
-
-<header class="topbar">
-
-<a
-href="/"
-class="brand"
->
-
-<div class="brand-icon">
-🤖
-</div>
-
-<div>
-
-<strong>
-SHAGGY XMD
-</strong>
-
-<span>
-Bot Control Center
-</span>
-
-</div>
-
-</a>
-
-<nav class="nav">
-
-<a href="/status">
-📡 Status
-</a>
-
-<a href="/manage">
-⚙ Manage
-</a>
-
-<a
-href="${PAIR_WEB_URL}"
-target="_blank"
-rel="noopener"
->
-🔗 Pair Web
-</a>
-
-</nav>
-
-</header>
-
-
-<section class="hero">
-
-<div class="eyebrow">
-
-<span class="dot"></span>
-
-SHAGGY XMD • LIVE CONTROL CENTER
-
-</div>
-
-
-<h1>
-Your Bot.<br>
-Your Control.<br>
-Your Power.
-</h1>
-
-
-<p>
-
-Welcome to the SHAGGY XMD control center.
-Monitor your bot network in real time,
-manage bot configuration and control
-your public/private operating mode.
-
-</p>
-
-
-<div class="actions">
-
-<a
-class="btn btn-primary"
-href="${PAIR_WEB_URL}"
-target="_blank"
-rel="noopener"
->
-🚀 Pair Your Bot
-</a>
-
-<a
-class="btn"
-href="/status"
->
-📊 Analytics
-</a>
-
-<a
-class="btn"
-href="/manage"
->
-⚙ Manage Bot
-</a>
-
-</div>
-
-</section>
-
-
-<section class="section">
-
-<div class="section-title">
-
-<small>
-LIVE NETWORK
-</small>
-
-<h2>
-Bot Network Overview
-</h2>
-
-<p>
-Live statistics automatically refresh every 5 seconds.
-</p>
-
-</div>
-
-
-<div class="stats">
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-🟢 Online Bots
-</div>
-
-<div class="stat-icon">
-🟢
-</div>
-
-</div>
-
-<div
-class="value"
-id="online"
->
---
-</div>
-
-<div class="note">
-Currently active sessions
-</div>
-
-</div>
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-🌐 Total Bots
-</div>
-
-<div class="stat-icon">
-🌐
-</div>
-
-</div>
-
-<div
-class="value"
-id="total"
->
---
-</div>
-
-<div class="note">
-All stored sessions
-</div>
-
-</div>
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-🔴 Offline
-</div>
-
-<div class="stat-icon">
-🔴
-</div>
-
-</div>
-
-<div
-class="value"
-id="offline"
->
---
-</div>
-
-<div class="note">
-Inactive sessions
-</div>
-
-</div>
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-⚡ Availability
-</div>
-
-<div class="stat-icon">
-⚡
-</div>
-
-</div>
-
-<div
-class="value"
-id="percentage"
->
---%
-</div>
-
-<div class="note">
-Online / total
-</div>
-
-</div>
-
-</div>
-
-</section>
-
-
-<section class="section">
-
-<div class="analytics-grid">
-
-<div class="card panel">
-
-<div class="panel-head">
-
-<div>
-
-<div class="panel-title">
-24 Hour Bot Analytics
-</div>
-
-<div class="panel-sub">
-Online and total bot activity
-</div>
-
-</div>
-
-<div class="live">
-<span class="dot"></span>
-LIVE
-</div>
-
-</div>
-
-<div class="chart">
-
-<canvas
-id="homeChart"
-></canvas>
-
-</div>
-
-</div>
-
-
-<div class="card panel">
-
-<div class="panel-head">
-
-<div>
-
-<div class="panel-title">
-Network Health
-</div>
-
-<div class="panel-sub">
-Current system information
-</div>
-
-</div>
-
-</div>
-
-
-<div class="system-list">
-
-<div class="system-row">
-
-<span>
-Refresh
-</span>
-
-<span>
-5 seconds
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Analytics
-</span>
-
-<span>
-24 hours
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Metrics
-</span>
-
-<span>
-MongoDB
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Threshold
-</span>
-
-<span
-id="threshold"
->
---
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Last update
-</span>
-
-<span
-id="updated"
->
---
-</span>
-
-</div>
-
-</div>
-
-</div>
-
-</div>
-
-</section>
-
-
-<section class="section">
-
-<div class="features">
-
-
-<div class="card feature">
-
-<div class="feature-icon">
-📡
-</div>
-
-<h3>
-Real-Time Monitoring
-</h3>
-
-<p>
-Live bot counts refresh every five seconds
-without manually reloading the page.
-</p>
-
-</div>
-
-
-<div class="card feature">
-
-<div class="feature-icon">
-📈
-</div>
-
-<h3>
-24H Analytics
-</h3>
-
-<p>
-Historical MongoDB snapshots are displayed
-as a smooth activity line chart.
-</p>
-
-</div>
-
-
-<div class="card feature">
-
-<div class="feature-icon">
-🔐
-</div>
-
-<h3>
-Public / Private Mode
-</h3>
-
-<p>
-Switch your bot operating mode directly
-from the secure management panel.
-</p>
-
-</div>
-
-</div>
-
-</section>
-
-
-<footer class="footer">
-
-SHAGGY XMD Control Center •
-
-<a
-href="${PAIR_WEB_URL}"
-target="_blank"
-rel="noopener"
->
-www.shaggytech.online
-</a>
-
-</footer>
-
-</div>
-
-
-<script
-src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"
-></script>
-
-
-<script>
-
-const homeChart =
-new Chart(
-document
-.getElementById(
-'homeChart'
-)
-.getContext('2d'),
-{
-
-type:
-'line',
-
-data: {
-
-labels: [],
-
-datasets: [
-
-{
-
-label:
-'Online Bots',
-
-data: [],
-
-borderColor:
-'#00eaff',
-
-backgroundColor:
-'rgba(0,234,255,.07)',
-
-fill:
-true,
-
-tension:
-.42,
-
-pointRadius:
-1.5,
-
-borderWidth:
-2
-
-},
-
-{
-
-label:
-'Total Bots',
-
-data: [],
-
-borderColor:
-'#a855f7',
-
-backgroundColor:
-'rgba(168,85,247,.03)',
-
-fill:
-false,
-
-tension:
-.42,
-
-pointRadius:
-1.5,
-
-borderWidth:
-2
-
-}
-
-]
-
-},
-
-options: {
-
-responsive:
-true,
-
-maintainAspectRatio:
-false,
-
-interaction: {
-
-intersect:
-false,
-
-mode:
-'index'
-
-},
-
-plugins: {
-
-legend: {
-
-labels: {
-
-color:
-'#9aa7bd',
-
-font: {
-size: 9
-}
-
-}
-
-}
-
-},
-
-scales: {
-
-x: {
-
-grid: {
-color:
-'rgba(255,255,255,.035)'
-},
-
-ticks: {
-
-color:
-'#59667b',
-
-maxTicksLimit:
-7
-
-}
-
-},
-
-y: {
-
-beginAtZero:
-true,
-
-grid: {
-
-color:
-'rgba(255,255,255,.035)'
-
-},
-
-ticks: {
-
-color:
-'#59667b',
-
-precision:
-0
-
-}
-
-}
-
-}
-
-}
-
-}
-);
-
-
-async function loadHome() {
-
-try {
-
-const statsResponse =
-await fetch(
-'/api/online-count',
-{
-cache:
-'no-store'
-}
-);
-
-const stats =
-await statsResponse.json();
-
-
-document.getElementById(
-'online'
-).textContent =
-stats.online;
-
-document.getElementById(
-'total'
-).textContent =
-stats.total;
-
-document.getElementById(
-'offline'
-).textContent =
-stats.offline;
-
-document.getElementById(
-'percentage'
-).textContent =
-Number(
-stats.percentage || 0
-).toFixed(1) + '%';
-
-document.getElementById(
-'threshold'
-).textContent =
-(stats.thresholdMinutes || 0)
-+ ' min';
-
-document.getElementById(
-'updated'
-).textContent =
-new Date(
-stats.time
-).toLocaleTimeString();
-
-
-const analyticsResponse =
-await fetch(
-'/api/analytics?hours=24',
-{
-cache:
-'no-store'
-}
-);
-
-const analytics =
-await analyticsResponse.json();
-
-
-if (
-analytics &&
-Array.isArray(
-analytics.data
-)
-) {
-
-homeChart.data.labels =
-analytics.data.map(
-row =>
-new Date(
-row.time
-).toLocaleTimeString(
-[],
-{
-hour:
-'2-digit',
-minute:
-'2-digit'
-}
-)
-);
-
-homeChart.data.datasets[0]
-.data =
-analytics.data.map(
-row =>
-row.online
-);
-
-homeChart.data.datasets[1]
-.data =
-analytics.data.map(
-row =>
-row.total
-);
-
-homeChart.update();
-
-}
-
-} catch (error) {
-
-console.error(
-'Dashboard refresh:',
-error
-);
-
-}
-
-}
-
-
-loadHome();
-
-setInterval(
-loadHome,
-5000
-);
-
-</script>
-
-</body>
-
-</html>
-
-`);
 
   }
 );
 
-
 /* =========================================================
-   STATUS PAGE
+   CHARTS
 ========================================================= */
 
-app.get(
-  '/status',
-  (req, res) => {
-
-    res.set(
-      'Cache-Control',
-      'no-store'
-    );
-
-    res.send(`
-
-<!DOCTYPE html>
-
-<html lang="en">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1.0"
->
-
-<title>
-SHAGGY XMD • Analytics
-</title>
-
-<script
-src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"
-></script>
-
-<style>
-${CSS}
-</style>
-
-</head>
-
-<body>
-
-${loaderHTML()}
-
-<div class="wrap">
-
-<header class="topbar">
-
-<a
-href="/"
-class="brand"
->
-
-<div class="brand-icon">
-📊
-</div>
-
-<div>
-
-<strong>
-SHAGGY XMD
-</strong>
-
-<span>
-Analytics Center
-</span>
-
-</div>
-
-</a>
-
-
-<nav class="nav">
-
-<a href="/">
-🏠 Home
-</a>
-
-<a href="/manage">
-⚙ Manage
-</a>
-
-<a
-href="${PAIR_WEB_URL}"
-target="_blank"
-rel="noopener"
->
-🔗 Pair Web
-</a>
-
-</nav>
-
-</header>
-
-
-<section class="hero">
-
-<div class="eyebrow">
-
-<span class="dot"></span>
-
-LIVE ANALYTICS
-
-</div>
-
-
-<h1>
-Bot Network<br>
-Analytics.
-</h1>
-
-
-<p>
-Real-time monitoring combined with historical
-24-hour activity data stored in MongoDB.
-The dashboard refreshes every five seconds.
-</p>
-
-</section>
-
-
-<section class="section">
-
-<div class="stats">
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-🟢 Online
-</div>
-
-<div class="stat-icon">
-🟢
-</div>
-
-</div>
-
-<div
-class="value"
-id="online"
->
---
-</div>
-
-<div class="note">
-Active now
-</div>
-
-</div>
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-🌐 Total
-</div>
-
-<div class="stat-icon">
-🌐
-</div>
-
-</div>
-
-<div
-class="value"
-id="total"
->
---
-</div>
-
-<div class="note">
-All sessions
-</div>
-
-</div>
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-🔴 Offline
-</div>
-
-<div class="stat-icon">
-🔴
-</div>
-
-</div>
-
-<div
-class="value"
-id="offline"
->
---
-</div>
-
-<div class="note">
-Inactive
-</div>
-
-</div>
-
-
-<div class="card stat">
-
-<div class="stat-top">
-
-<div class="label">
-⚡ Availability
-</div>
-
-<div class="stat-icon">
-⚡
-</div>
-
-</div>
-
-<div
-class="value"
-id="percentage"
->
---%
-</div>
-
-<div class="note">
-Network health
-</div>
-
-</div>
-
-</div>
-
-</section>
-
-
-<section class="section">
-
-<div class="card panel">
-
-<div class="panel-head">
-
-<div>
-
-<div class="panel-title">
-24 Hour Activity Line
-</div>
-
-<div class="panel-sub">
-Bot network activity by minute
-</div>
-
-</div>
-
-<div
-class="live"
-id="connection"
->
-
-<span class="dot"></span>
-
-LIVE
-
-</div>
-
-</div>
-
-
-<div class="chart">
-
-<canvas
-id="chart"
-></canvas>
-
-</div>
-
-</div>
-
-</section>
-
-
-<section class="section">
-
-<div class="analytics-grid">
-
-
-<div class="card panel">
-
-<div class="panel-head">
-
-<div>
-
-<div class="panel-title">
-Availability Percentage
-</div>
-
-<div class="panel-sub">
-24 hour availability trend
-</div>
-
-</div>
-
-</div>
-
-
-<div class="chart chart-small">
-
-<canvas
-id="availabilityChart"
-></canvas>
-
-</div>
-
-</div>
-
-
-<div class="card panel">
-
-<div class="panel-head">
-
-<div>
-
-<div class="panel-title">
-System Information
-</div>
-
-<div class="panel-sub">
-Live monitor configuration
-</div>
-
-</div>
-
-</div>
-
-
-<div class="system-list">
-
-
-<div class="system-row">
-
-<span>
-Refresh
-</span>
-
-<span>
-5 seconds
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Chart period
-</span>
-
-<span>
-24 hours
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Threshold
-</span>
-
-<span
-id="threshold"
->
---
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Metrics
-</span>
-
-<span>
-MongoDB
-</span>
-
-</div>
-
-
-<div class="system-row">
-
-<span>
-Last update
-</span>
-
-<span
-id="updated"
->
---
-</span>
-
-</div>
-
-</div>
-
-</div>
-
-</div>
-
-</section>
-
-
-<footer class="footer">
-
-SHAGGY XMD Analytics •
-
-<a
-href="${PAIR_WEB_URL}"
-target="_blank"
-rel="noopener"
->
-www.shaggytech.online
-</a>
-
-</footer>
-
-</div>
-
-
-<script>
-
-const chart =
-new Chart(
-
-document
-.getElementById(
-'chart'
-)
-.getContext('2d'),
-
-{
-
-type:
-'line',
-
-data: {
-
-labels: [],
-
-datasets: [
-
-{
-
-label:
-'Online Bots',
-
-data: [],
-
-borderColor:
-'#00eaff',
-
-backgroundColor:
-'rgba(0,234,255,.08)',
-
-fill:
-true,
-
-tension:
-.42,
-
-pointRadius:
-1.5,
-
-borderWidth:
-2
-
-},
-
-{
-
-label:
-'Total Bots',
-
-data: [],
-
-borderColor:
-'#a855f7',
-
-backgroundColor:
-'rgba(168,85,247,.025)',
-
-fill:
-false,
-
-tension:
-.42,
-
-pointRadius:
-1.5,
-
-borderWidth:
-2
-
-},
-
-{
-
-label:
-'Offline Bots',
-
-data: [],
-
-borderColor:
-'#ff5577',
-
-backgroundColor:
-'transparent',
-
-fill:
-false,
-
-tension:
-.42,
-
-pointRadius:
-1.2,
-
-borderWidth:
-1.5
-
-}
-
-]
-
-},
-
-options: {
-
-responsive:
-true,
-
-maintainAspectRatio:
-false,
-
-interaction: {
-
-intersect:
-false,
-
-mode:
-'index'
-
-},
-
-plugins: {
-
-legend: {
-
-labels: {
-
-color:
-'#9aa7bd',
-
-font:
-{
-size: 9
-}
-
-}
-
-}
-
-},
-
-scales: {
-
-x: {
-
-grid: {
-
-color:
-'rgba(255,255,255,.035)'
-
-},
-
-ticks: {
-
-color:
-'#59667b',
-
-maxTicksLimit:
-12
-
-}
-
-},
-
-y: {
-
-beginAtZero:
-true,
-
-grid: {
-
-color:
-'rgba(255,255,255,.035)'
-
-},
-
-ticks: {
-
-color:
-'#59667b',
-
-precision:
-0
-
-}
-
-}
-
-}
-
-}
-
-}
-
-);
-
-
-const availabilityChart =
-new Chart(
-
-document
-.getElementById(
-'availabilityChart'
-)
-.getContext('2d'),
-
-{
-
-type:
-'line',
-
-data: {
-
-labels: [],
-
-datasets: [
-
-{
-
-label:
-'Availability %',
-
-data: [],
-
-borderColor:
-'#21f39a',
-
-backgroundColor:
-'rgba(33,243,154,.07)',
-
-fill:
-true,
-
-tension:
-.42,
-
-pointRadius:
-1.2,
-
-borderWidth:
-2
-
-}
-
-]
-
-},
-
-options: {
-
-responsive:
-true,
-
-maintainAspectRatio:
-false,
-
-plugins: {
-
-legend: {
-
-labels: {
-
-color:
-'#9aa7bd',
-
-font:
-{
-size: 9
-}
-
-}
-
-}
-
-},
-
-scales: {
-
-x: {
-
-grid: {
-
-color:
-'rgba(255,255,255,.035)'
-
-},
-
-ticks: {
-
-color:
-'#59667b',
-
-maxTicksLimit:
-8
-
-}
-
-},
-
-y: {
-
-beginAtZero:
-true,
-
-max:
-100,
-
-grid: {
-
-color:
-'rgba(255,255,255,.035)'
-
-},
-
-ticks: {
-
-color:
-'#59667b',
-
-callback:
-value =>
-value + '%'
-
-}
-
-}
-
-}
-
-}
-
-}
-
-);
-
-
-async function updateStatus() {
-
-try {
-
-const statsResponse =
-await fetch(
-'/api/online-count',
-{
-cache:
-'no-store'
-}
-);
-
-const stats =
-await statsResponse.json();
-
-
-document.getElementById(
-'online'
-).textContent =
-stats.online;
-
-document.getElementById(
-'total'
-).textContent =
-stats.total;
-
-document.getElementById(
-'offline'
-).textContent =
-stats.offline;
-
-document.getElementById(
-'percentage'
-).textContent =
-Number(
-stats.percentage || 0
-).toFixed(1) + '%';
-
-document.getElementById(
-'threshold'
-).textContent =
-(stats.thresholdMinutes || 0)
-+ ' minutes';
-
-document.getElementById(
-'updated'
-).textContent =
-new Date(
-stats.time
-).toLocaleTimeString();
-
-
-const analyticsResponse =
-await fetch(
-'/api/analytics?hours=24',
-{
-cache:
-'no-store'
-}
-);
-
-const analytics =
-await analyticsResponse.json();
-
-
-if (
-analytics &&
-Array.isArray(
-analytics.data
-)
+let countChart =
+  null;
+
+let availabilityChart =
+  null;
+
+const errorBox =
+  document.getElementById(
+    'errorBox'
+  );
+
+function chartCommonOptions(
+  beginAtZero
 ) {
 
-const rows =
-analytics.data;
+  return {
 
+    responsive:
+      true,
 
-const labels =
-rows.map(
-row =>
-new Date(
-row.time
-).toLocaleTimeString(
-[],
-{
-hour:
-'2-digit',
-minute:
-'2-digit'
+    maintainAspectRatio:
+      false,
+
+    interaction: {
+      mode:
+        'index',
+
+      intersect:
+        false
+    },
+
+    animation: {
+      duration:
+        350
+    },
+
+    scales: {
+
+      x: {
+
+        ticks: {
+          color:
+            '#94a3b8',
+
+          maxTicksLimit:
+            8,
+
+          maxRotation:
+            0
+        },
+
+        grid: {
+          color:
+            'rgba(255,255,255,.045)'
+        }
+
+      },
+
+      y: {
+
+        beginAtZero:
+          beginAtZero,
+
+        ticks: {
+          color:
+            '#94a3b8'
+        },
+
+        grid: {
+          color:
+            'rgba(255,255,255,.045)'
+        }
+
+      }
+
+    },
+
+    plugins: {
+
+      legend: {
+
+        labels: {
+          color:
+            '#e2e8f0',
+
+          usePointStyle:
+            true,
+
+          padding:
+            15
+        }
+
+      }
+
+    }
+
+  };
 }
-)
-);
 
+function createCharts() {
 
-chart.data.labels =
-labels;
+  if (
+    typeof Chart ===
+    'undefined'
+  ) {
 
-chart.data.datasets[0]
-.data =
-rows.map(
-row =>
-row.online
-);
+    errorBox.textContent =
+      '⚠ Chart library load wenne na.';
 
-chart.data.datasets[1]
-.data =
-rows.map(
-row =>
-row.total
-);
+    errorBox.style.display =
+      'block';
 
-chart.data.datasets[2]
-.data =
-rows.map(
-row =>
-row.offline
-);
-
-
-availabilityChart
-.data.labels =
-labels;
-
-availabilityChart
-.data.datasets[0]
-.data =
-rows.map(
-row =>
-row.percentage
-);
-
-
-chart.update();
-
-availabilityChart.update();
-
-}
-
-
-document.getElementById(
-'connection'
-).innerHTML =
-'<span class="dot"></span> LIVE';
-
-} catch (error) {
-
-document.getElementById(
-'connection'
-).innerHTML =
-'<span class="dot" style="background:#ff5577"></span> ERROR';
-
-}
-
-}
-
-
-updateStatus();
-
-setInterval(
-updateStatus,
-5000
-);
-
-</script>
-
-</body>
-
-</html>
-
-`);
-
+    return false;
   }
-);
 
+  const countCtx =
+    document
+      .getElementById(
+        'countChart'
+      )
+      .getContext('2d');
 
-/* =========================================================
-   MANAGE PAGE
-========================================================= */
+  const availabilityCtx =
+    document
+      .getElementById(
+        'availabilityChart'
+      )
+      .getContext('2d');
 
-app.get(
-  '/manage',
-  (req, res) => {
+  countChart =
+    new Chart(
+      countCtx,
+      {
 
-    res.set(
-      'Cache-Control',
-      'no-store'
-    );
+        type:
+          'line',
 
-    res.send(`
+        data: {
 
-<!DOCTYPE html>
+          labels: [],
 
-<html lang="en">
+          datasets: [
 
-<head>
+            {
 
-<meta charset="UTF-8">
+              label:
+                'Online Bots',
 
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1.0"
->
+              data: [],
 
-<title>
-SHAGGY XMD • Manage
-</title>
+              borderColor:
+                '#34d399',
 
-<style>
-${CSS}
-</style>
+              backgroundColor:
+                'rgba(52,211,153,.10)',
 
-</head>
+              borderWidth:
+                2,
 
-<body>
+              pointRadius:
+                1,
 
-${loaderHTML()}
+              pointHoverRadius:
+                5,
 
-<div class="wrap">
+              tension:
+                .35,
 
-<header class="topbar">
+              fill:
+                true
 
-<a
-href="/"
-class="brand"
->
+            },
 
-<div class="brand-icon">
-⚙️
-</div>
+            {
 
-<div>
+              label:
+                'Total Bots',
 
-<strong>
-SHAGGY XMD
-</strong>
+              data: [],
 
-<span>
-Bot Management
-</span>
+              borderColor:
+                '#60a5fa',
 
-</div>
+              backgroundColor:
+                'rgba(96,165,250,.05)',
 
-</a>
+              borderWidth:
+                2,
 
+              pointRadius:
+                1,
 
-<nav class="nav">
+              pointHoverRadius:
+                5,
 
-<a href="/">
-🏠 Home
-</a>
+              tension:
+                .35,
 
-<a href="/status">
-📊 Analytics
-</a>
+              fill:
+                false
 
-<a
-href="${PAIR_WEB_URL}"
-target="_blank"
-rel="noopener"
->
-🔗 Pair Web
-</a>
+            }
 
-</nav>
+          ]
 
-</header>
+        },
 
-
-<div
-id="login"
-class="login"
->
-
-<div class="card login-box">
-
-<div class="login-icon">
-🔐
-</div>
-
-<h1>
-Secure Bot Access
-</h1>
-
-<p>
-Enter the access key assigned to your bot
-to open the management dashboard.
-</p>
-
-
-<div class="field">
-
-<label>
-Access Key
-</label>
-
-<input
-id="key"
-placeholder="Enter your access key"
-autocomplete="off"
-spellcheck="false"
->
-
-</div>
-
-
-<button
-id="loginBtn"
-class="btn btn-primary full"
->
-🔓 Open Dashboard
-</button>
-
-
-<div
-id="loginMsg"
-class="msg error"
-></div>
-
-</div>
-
-</div>
-
-
-<div
-id="dashboard"
-style="display:none"
->
-
-<div class="manage">
-
-
-<div class="card settings">
-
-<div class="settings-head">
-
-<div>
-
-<h1>
-Bot Configuration
-</h1>
-
-<p>
-Customize your bot from the web panel.
-</p>
-
-</div>
-
-<div
-id="botNumber"
-class="bot-number"
->
-📱 Bot: N/A
-</div>
-
-</div>
-
-
-<div class="group">
-
-<div class="group-title">
-
-<span>
-🎨
-</span>
-
-Bot Identity
-
-</div>
-
-
-<div class="form-grid">
-
-
-<div class="field">
-
-<label>
-Bot Name
-</label>
-
-<input
-id="botName"
-placeholder="SHAGGY XMD"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Bot Footer
-</label>
-
-<input
-id="botFooter"
-placeholder="POWERED BY SHAGGY"
->
-
-</div>
-
-
-<div class="field wide">
-
-<label>
-Bot Image URL
-</label>
-
-<input
-id="botImage"
-placeholder="https://example.com/bot.jpg"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Movie Footer
-</label>
-
-<input
-id="movieFooter"
-placeholder="SHAGGY XMD MOVIE"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-MOVIE_CAPTION
-</label>
-
-<input
-id="movieCaption"
-placeholder="🎬 ${'${'}title${'}'}"
->
-
-</div>
-
-</div>
-
-</div>
-
-
-<div class="group">
-
-<div class="group-title">
-
-<span>
-🌐
-</span>
-
-Bot Mode
-
-</div>
-
-
-<div class="mode-selector">
-
-
-<label class="mode-option">
-
-<input
-type="radio"
-name="mode"
-value="PUBLIC"
-id="modePublic"
->
-
-<span
-class="mode-card public"
->
-
-<strong>
-🌐 PUBLIC MODE
-</strong>
-
-<small>
-Normal public bot mode.
-Use when your bot should operate publicly.
-</small>
-
-</span>
-
-</label>
-
-
-<label class="mode-option">
-
-<input
-type="radio"
-name="mode"
-value="PRIVATE"
-id="modePrivate"
->
-
-<span
-class="mode-card private"
->
-
-<strong>
-🔐 PRIVATE MODE
-</strong>
-
-<small>
-Private/restricted bot mode.
-UI will show private status.
-</small>
-
-</span>
-
-</label>
-
-
-</div>
-
-</div>
-
-
-<div class="group">
-
-<div class="group-title">
-
-<span>
-⚡
-</span>
-
-Behaviour Settings
-
-</div>
-
-
-<div class="toggles">
-
-
-<div class="toggle">
-
-<div>
-
-<strong>
-⚡ Always Online
-</strong>
-
-<small>
-Keep bot presence online
-</small>
-
-</div>
-
-<label class="switch">
-
-<input
-id="alwaysOnline"
-type="checkbox"
->
-
-<span class="slider"></span>
-
-</label>
-
-</div>
-
-
-<div class="toggle">
-
-<div>
-
-<strong>
-👁️ Message Seen
-</strong>
-
-<small>
-Mark messages as seen
-</small>
-
-</div>
-
-<label class="switch">
-
-<input
-id="alwaysMsgSeen"
-type="checkbox"
->
-
-<span class="slider"></span>
-
-</label>
-
-</div>
-
-
-<div class="toggle">
-
-<div>
-
-<strong>
-📱 Status View
-</strong>
-
-<small>
-View status updates
-</small>
-
-</div>
-
-<label class="switch">
-
-<input
-id="statusView"
-type="checkbox"
->
-
-<span class="slider"></span>
-
-</label>
-
-</div>
-
-
-<div class="toggle">
-
-<div>
-
-<strong>
-❤️ Auto Like
-</strong>
-
-<small>
-Automatically like statuses
-</small>
-
-</div>
-
-<label class="switch">
-
-<input
-id="autoLike"
-type="checkbox"
->
-
-<span class="slider"></span>
-
-</label>
-
-</div>
-
-
-<div class="toggle">
-
-<div>
-
-<strong>
-🛡️ Anti Delete
-</strong>
-
-<small>
-Enable anti-delete
-</small>
-
-</div>
-
-<label class="switch">
-
-<input
-id="antiDelete"
-type="checkbox"
->
-
-<span class="slider"></span>
-
-</label>
-
-</div>
-
-
-</div>
-
-</div>
-
-
-<div class="save-row">
-
-<button
-id="saveBtn"
-class="btn btn-primary"
->
-💾 Save Changes
-</button>
-
-<a
-href="/status"
-class="btn"
->
-📊 Analytics
-</a>
-
-</div>
-
-
-<div
-id="saveMsg"
-class="msg"
-></div>
-
-</div>
-
-
-<div class="card preview">
-
-<div class="preview-label">
-LIVE BOT PREVIEW
-</div>
-
-
-<div
-id="avatar"
-class="avatar"
->
-🤖
-</div>
-
-
-<div
-id="previewMode"
-class="mode-badge mode-public"
-style="display:flex;width:max-content;margin:0 auto 12px"
->
-🌐 PUBLIC
-</div>
-
-
-<div
-id="previewName"
-class="preview-name"
->
-SHAGGY XMD
-</div>
-
-
-<div
-id="previewFooter"
-class="preview-footer"
->
-POWERED BY SHAGGY
-</div>
-
-
-<div class="movie-preview">
-
-<div class="movie-preview-title">
-MOVIE CAPTION
-</div>
-
-<div
-id="previewMovie"
-class="movie-preview-text"
->
-Movie caption preview...
-</div>
-
-</div>
-
-</div>
-
-
-</div>
-
-</div>
-
-
-<footer class="footer">
-
-SHAGGY XMD Bot Management •
-
-<a
-href="${PAIR_WEB_URL}"
-target="_blank"
-rel="noopener"
->
-www.shaggytech.online
-</a>
-
-</footer>
-
-</div>
-
-
-<script>
-
-let currentKey = null;
-
-
-const login =
-document.getElementById(
-'login'
-);
-
-const dashboard =
-document.getElementById(
-'dashboard'
-);
-
-const key =
-document.getElementById(
-'key'
-);
-
-const loginBtn =
-document.getElementById(
-'loginBtn'
-);
-
-const loginMsg =
-document.getElementById(
-'loginMsg'
-);
-
-
-const botName =
-document.getElementById(
-'botName'
-);
-
-const botImage =
-document.getElementById(
-'botImage'
-);
-
-const botFooter =
-document.getElementById(
-'botFooter'
-);
-
-const movieFooter =
-document.getElementById(
-'movieFooter'
-);
-
-const movieCaption =
-document.getElementById(
-'movieCaption'
-);
-
-
-const modePublic =
-document.getElementById(
-'modePublic'
-);
-
-const modePrivate =
-document.getElementById(
-'modePrivate'
-);
-
-
-const alwaysOnline =
-document.getElementById(
-'alwaysOnline'
-);
-
-const alwaysMsgSeen =
-document.getElementById(
-'alwaysMsgSeen'
-);
-
-const statusView =
-document.getElementById(
-'statusView'
-);
-
-const autoLike =
-document.getElementById(
-'autoLike'
-);
-
-const antiDelete =
-document.getElementById(
-'antiDelete'
-);
-
-
-const avatar =
-document.getElementById(
-'avatar'
-);
-
-const previewName =
-document.getElementById(
-'previewName'
-);
-
-const previewFooter =
-document.getElementById(
-'previewFooter'
-);
-
-const previewMovie =
-document.getElementById(
-'previewMovie'
-);
-
-const previewMode =
-document.getElementById(
-'previewMode'
-);
-
-
-function getMode() {
-
-return modePrivate.checked
-  ? 'PRIVATE'
-  : 'PUBLIC';
-
-}
-
-
-function preview() {
-
-previewName.textContent =
-botName.value.trim() ||
-'SHAGGY XMD';
-
-previewFooter.textContent =
-botFooter.value.trim() ||
-'POWERED BY SHAGGY';
-
-
-previewMovie.textContent =
-movieCaption.value.trim() ||
-'Movie caption preview...';
-
-
-const mode =
-getMode();
-
-
-if (
-mode === 'PRIVATE'
-) {
-
-previewMode.className =
-'mode-badge mode-private';
-
-previewMode.textContent =
-'🔐 PRIVATE';
-
-} else {
-
-previewMode.className =
-'mode-badge mode-public';
-
-previewMode.textContent =
-'🌐 PUBLIC';
-
-}
-
-
-const image =
-botImage.value.trim();
-
-
-if (!image) {
-
-avatar.innerHTML =
-'🤖';
-
-return;
-
-}
-
-
-avatar.innerHTML = '';
-
-const img =
-document.createElement(
-'img'
-);
-
-img.src =
-image;
-
-img.alt =
-'Bot Image';
-
-img.onerror =
-function() {
-
-avatar.innerHTML =
-'🤖';
-
-};
-
-avatar.appendChild(
-img
-);
-
-}
-
-
-async function doLogin() {
-
-const accessKey =
-key.value.trim();
-
-
-if (!accessKey) {
-
-loginMsg.textContent =
-'Please enter your access key.';
-
-return;
-
-}
-
-
-loginBtn.textContent =
-'⏳ Checking...';
-
-loginBtn.style.opacity =
-'.6';
-
-
-try {
-
-const response =
-await fetch(
-'/api/bot-settings/' +
-encodeURIComponent(
-accessKey
-),
-{
-cache:
-'no-store'
-}
-);
-
-
-const data =
-await response.json();
-
-
-if (!response.ok) {
-
-throw new Error(
-data.error ||
-'Invalid access key'
-);
-
-}
-
-
-currentKey =
-accessKey;
-
-
-document.getElementById(
-'botNumber'
-).textContent =
-'📱 Bot: ' +
-(data.number || 'N/A');
-
-
-botName.value =
-data.BOT_NAME || '';
-
-botImage.value =
-data.BOT_IMAGE || '';
-
-botFooter.value =
-data.BOT_FOOTER || '';
-
-movieFooter.value =
-data.MOVIE_FOOTER || '';
-
-movieCaption.value =
-data.MOVIE_CAPTION || '';
-
-
-if (
-data.MODE ===
-'PRIVATE'
-) {
-
-modePrivate.checked =
-true;
-
-} else {
-
-modePublic.checked =
-true;
-
-}
-
-
-alwaysOnline.checked =
-!!data.ALWAYS_ONLINE;
-
-alwaysMsgSeen.checked =
-!!data.ALWAYS_MSG_SEEN;
-
-statusView.checked =
-!!data.STATUS_VIEW;
-
-autoLike.checked =
-!!data.AUTO_LIKE;
-
-antiDelete.checked =
-!!data.ANTI_DELETE;
-
-
-preview();
-
-
-login.style.display =
-'none';
-
-dashboard.style.display =
-'block';
-
-
-} catch (error) {
-
-loginMsg.textContent =
-error.message;
-
-} finally {
-
-loginBtn.textContent =
-'🔓 Open Dashboard';
-
-loginBtn.style.opacity =
-'1';
-
-}
-
-}
-
-
-async function saveSettings() {
-
-if (!currentKey) {
-return;
-}
-
-
-const saveBtn =
-document.getElementById(
-'saveBtn'
-);
-
-const saveMsg =
-document.getElementById(
-'saveMsg'
-);
-
-
-saveBtn.textContent =
-'⏳ Saving...';
-
-
-try {
-
-const payload = {
-
-BOT_NAME:
-botName.value.trim(),
-
-BOT_IMAGE:
-botImage.value.trim(),
-
-BOT_FOOTER:
-botFooter.value.trim(),
-
-MOVIE_FOOTER:
-movieFooter.value.trim(),
-
-MOVIE_CAPTION:
-movieCaption.value.trim(),
-
-MODE:
-getMode(),
-
-ALWAYS_ONLINE:
-alwaysOnline.checked,
-
-ALWAYS_MSG_SEEN:
-alwaysMsgSeen.checked,
-
-STATUS_VIEW:
-statusView.checked,
-
-AUTO_LIKE:
-autoLike.checked,
-
-ANTI_DELETE:
-antiDelete.checked
-
-};
-
-
-const response =
-await fetch(
-'/api/bot-settings/' +
-encodeURIComponent(
-currentKey
-),
-{
-
-method:
-'POST',
-
-headers: {
-
-'Content-Type':
-'application/json'
-
-},
-
-body:
-JSON.stringify(
-payload
-)
-
-}
-);
-
-
-const data =
-await response.json();
-
-
-if (!response.ok) {
-
-throw new Error(
-data.error ||
-'Save failed'
-);
-
-}
-
-
-saveMsg.className =
-'msg success';
-
-saveMsg.textContent =
-'✓ Settings saved successfully.';
-
-preview();
-
-
-} catch (error) {
-
-saveMsg.className =
-'msg error';
-
-saveMsg.textContent =
-error.message;
-
-} finally {
-
-saveBtn.textContent =
-'💾 Save Changes';
-
-}
-
-}
-
-
-loginBtn.addEventListener(
-'click',
-doLogin
-);
-
-
-key.addEventListener(
-'keydown',
-function(event) {
-
-if (
-event.key ===
-'Enter'
-) {
-
-doLogin();
-
-}
-
-}
-);
-
-
-[
-botName,
-botImage,
-botFooter,
-movieFooter,
-movieCaption
-].forEach(
-function(input) {
-
-input.addEventListener(
-'input',
-preview
-);
-
-}
-);
-
-
-[
-modePublic,
-modePrivate
-].forEach(
-function(input) {
-
-input.addEventListener(
-'change',
-preview
-);
-
-}
-);
-
-
-document
-.getElementById(
-'saveBtn'
-)
-.addEventListener(
-'click',
-saveSettings
-);
-
-
-preview();
-
-</script>
-
-</body>
-
-</html>
-
-`);
-
-  }
-);
-
-
-/* =========================================================
-   START
-========================================================= */
-
-connectDB()
-
-.then(
-  async () => {
-
-    /*
-     * Create initial snapshot.
-     */
-    await saveMetricsSnapshot();
-
-    /*
-     * Save one analytics snapshot
-     * every 60 seconds.
-     */
-    setInterval(
-      saveMetricsSnapshot,
-      60 * 1000
-    );
-
-    /*
-     * Clean metrics every hour.
-     */
-    setInterval(
-      cleanOldMetrics,
-      60 * 60 * 1000
-    );
-
-
-    app.listen(
-      PORT,
-      () => {
-
-        console.log(
-          `🚀 Server running on port ${PORT}`
-        );
-
-        console.log(
-          `🏠 Home: /`
-        );
-
-        console.log(
-          `📊 Analytics: /status`
-        );
-
-        console.log(
-          `⚙️ Manage: /manage`
-        );
-
-        console.log(
-          `📈 Analytics API: /api/analytics`
-        );
-
-        console.log(
-          `🔗 Pair Web: ${PAIR_WEB_URL}`
-        );
-
-        console.log(
-          `🌐 Default Mode: ${DEFAULT_MODE}`
-        );
+        options:
+          chartCommonOptions(
+            true
+          )
 
       }
     );
 
-  }
-)
+  availabilityChart =
+    new Chart(
+      availabilityCtx,
+      {
 
-.catch(
-  err => {
+        type:
+          'line',
 
-    console.error(
-      '❌ MongoDB connection failed:',
-      err.message
+        data: {
+
+          labels: [],
+
+          datasets: [
+
+            {
+
+              label:
+                'Availability %',
+
+              data: [],
+
+              borderColor:
+                '#a78bfa',
+
+              backgroundColor:
+                'rgba(167,139,250,.12)',
+
+              borderWidth:
+                2,
+
+              pointRadius:
+                1,
+
+              pointHoverRadius:
+                5,
+
+              tension:
+                .35,
+
+              fill:
+                true
+
+            }
+
+          ]
+
+        },
+
+        options: {
+
+          ...chartCommonOptions(
+            true
+          ),
+
+          scales: {
+
+            x: {
+
+              ticks: {
+                color:
+                  '#94a3b8',
+
+                maxTicksLimit:
+                  8,
+
+                maxRotation:
+                  0
+              },
+
+              grid: {
+                color:
+                  'rgba(255,255,255,.045)'
+              }
+
+            },
+
+            y: {
+
+              beginAtZero:
+                true,
+
+              max:
+                100,
+
+              ticks: {
+
+                color:
+                  '#94a3b8',
+
+                callback:
+                  function(value) {
+                    return value + '%';
+                  }
+
+              },
+
+              grid: {
+                color:
+                  'rgba(255,255,255,.045)'
+              }
+
+            }
+
+          }
+
+        }
+
+      }
     );
 
-    process.exit(1);
+  return true;
+}
+
+/* =========================================================
+   LIVE DATA
+========================================================= */
+
+async function updateLiveStats() {
+
+  try {
+
+    const res =
+      await fetch(
+        '/api/online-count',
+        {
+          cache:
+            'no-store'
+        }
+      );
+
+    if (!res.ok) {
+      throw new Error(
+        'Server error: ' +
+        res.status
+      );
+    }
+
+    const data =
+      await res.json();
+
+    document
+      .getElementById(
+        'onlineVal'
+      )
+      .textContent =
+        data.online;
+
+    document
+      .getElementById(
+        'totalVal'
+      )
+      .textContent =
+        data.total;
+
+    document
+      .getElementById(
+        'percentageVal'
+      )
+      .textContent =
+        Number(
+          data.percentage || 0
+        ).toFixed(1) +
+        '%';
+
+    document
+      .getElementById(
+        'lastUpdate'
+      )
+      .textContent =
+        ' • ' +
+        new Date(
+          data.time
+        ).toLocaleTimeString(
+          'en-GB'
+        );
+
+    errorBox.style.display =
+      'none';
+
+  } catch (err) {
+
+    console.error(
+      'Live stats:',
+      err
+    );
+
+    errorBox.textContent =
+      '⚠ Live data load error: ' +
+      err.message;
+
+    errorBox.style.display =
+      'block';
+  }
+}
+
+/* =========================================================
+   ANALYTICS
+========================================================= */
+
+async function updateAnalytics() {
+
+  try {
+
+    const res =
+      await fetch(
+        '/api/analytics?hours=24',
+        {
+          cache:
+            'no-store'
+        }
+      );
+
+    if (!res.ok) {
+      throw new Error(
+        'Analytics server error: ' +
+        res.status
+      );
+    }
+
+    const data =
+      await res.json();
+
+    const points =
+      data.points || [];
+
+    const labels =
+      points.map(
+        function(p) {
+
+          return new Date(
+            p.time
+          ).toLocaleTimeString(
+            'en-GB',
+            {
+              hour:
+                '2-digit',
+
+              minute:
+                '2-digit'
+            }
+          );
+
+        }
+      );
+
+    if (
+      countChart
+    ) {
+
+      countChart.data.labels =
+        labels;
+
+      countChart
+        .data
+        .datasets[0]
+        .data =
+          points.map(
+            p =>
+              p.online
+          );
+
+      countChart
+        .data
+        .datasets[1]
+        .data =
+          points.map(
+            p =>
+              p.total
+          );
+
+      countChart.update(
+        'none'
+      );
+    }
+
+    if (
+      availabilityChart
+    ) {
+
+      availabilityChart
+        .data
+        .labels =
+          labels;
+
+      availabilityChart
+        .data
+        .datasets[0]
+        .data =
+          points.map(
+            p =>
+              p.percentage
+          );
+
+      availabilityChart.update(
+        'none'
+      );
+    }
+
+    const summary =
+      data.summary || {};
+
+    document
+      .getElementById(
+        'peakVal'
+      )
+      .textContent =
+        Number(
+          summary.peakOnline ||
+          0
+        ).toFixed(0);
+
+    document
+      .getElementById(
+        'avgOnline'
+      )
+      .textContent =
+        Number(
+          summary.averageOnline ||
+          0
+        ).toFixed(1);
+
+    document
+      .getElementById(
+        'avgTotal'
+      )
+      .textContent =
+        Number(
+          summary.averageTotal ||
+          0
+        ).toFixed(1);
+
+    document
+      .getElementById(
+        'avgAvailability'
+      )
+      .textContent =
+        Number(
+          summary.averageAvailability ||
+          0
+        ).toFixed(1) +
+        '%';
+
+    document
+      .getElementById(
+        'minOnline'
+      )
+      .textContent =
+        Number(
+          summary.minOnline ||
+          0
+        ).toFixed(0);
+
+  } catch (err) {
+
+    console.error(
+      'Analytics:',
+      err
+    );
+
+    errorBox.textContent =
+      '⚠ Analytics load error: ' +
+      err.message;
+
+    errorBox.style.display =
+      'block';
+  }
+}
+
+/* =========================================================
+   INIT
+========================================================= */
+
+const chartsReady =
+  createCharts();
+
+updateLiveStats();
+
+updateAnalytics();
+
+/*
+  Live cards:
+  every 5 seconds
+
+  Historical charts:
+  every 30 seconds
+
+  This keeps the dashboard live
+  without hammering MongoDB.
+*/
+
+setInterval(
+  updateLiveStats,
+  5000
+);
+
+setInterval(
+  updateAnalytics,
+  30000
+);
+
+</script>
+
+</body>
+</html>`);
 
   }
 );
+
+/* =========================================================
+   START SERVER
+========================================================= */
+
+connectDB()
+
+  .then(
+    async () => {
+
+      /*
+        Save first analytics snapshot
+        when server starts.
+      */
+
+      await saveMetricsSnapshot();
+
+      /*
+        Save one snapshot every 60 seconds.
+
+        IMPORTANT:
+        Dashboard refresh 5 sec කියලා
+        MongoDB එකට 5 sec마다 metrics
+        write කරන්නේ නැහැ.
+      */
+
+      setInterval(
+        saveMetricsSnapshot,
+        60 * 1000
+      );
+
+      app.listen(
+        PORT,
+        () => {
+
+          console.log(
+            `🚀 Server running on port ${PORT}`
+          );
+
+          console.log(
+            `⚙ Manage page: /manage`
+          );
+
+          console.log(
+            `📊 Analytics page: /`
+          );
+
+          console.log(
+            `🔗 Pair Web: ${PAIR_WEB_URL}`
+          );
+
+          console.log(
+            `⏱ Online threshold: ${ONLINE_THRESHOLD_MINUTES} minutes`
+          );
+
+        }
+      );
+
+    }
+  )
+
+  .catch(
+    err => {
+
+      console.error(
+        '❌ MongoDB connection failed:',
+        err.message
+      );
+
+      process.exit(1);
+    }
+  );
